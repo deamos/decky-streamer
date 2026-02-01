@@ -385,7 +385,7 @@ class Plugin:
                     f"vaapih264enc {encoder_opts} ! "
                     f"h264parse ! queue ! "
                     f"flvmux name=mux ! "
-                    f"rtmpsink location=\"{rtmp_full_url} live=1\""
+                    f"rtmpsink location=\"{rtmp_full_url}\""
                 )
             else:
                 video_pipeline = (
@@ -394,7 +394,7 @@ class Plugin:
                     f"vaapih264enc {encoder_opts} ! "
                     f"h264parse ! queue ! "
                     f"flvmux name=mux ! "
-                    f"rtmpsink location=\"{rtmp_full_url} live=1\""
+                    f"rtmpsink location=\"{rtmp_full_url}\""
                 )
 
             cmd = f"{start_command} {video_pipeline}"
