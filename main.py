@@ -110,7 +110,7 @@ def unload_pa_modules(search_string):
 
 # Streaming platform presets
 PLATFORM_URLS = {
-    "twitch": "rtmp://live.twitch.tv/app",
+    "twitch": "rtmp://ingest.global-contribute.live-video.net/app",
     "youtube": "rtmp://a.rtmp.youtube.com/live2",
     "kick": "rtmp://fa723fc1b171.global-contribute.live-video.net/app",
     "facebook": "rtmps://live-api-s.facebook.com:443/rtmp",
@@ -213,6 +213,8 @@ class Plugin:
     _wakeup_count = 1
     _settings = None
     _stream_start_time = None
+    _stream_error: bool = False
+    _last_error_message: str = ""
     
 
     async def get_wakeup_count(self):
@@ -241,6 +243,41 @@ class Plugin:
                     logger.warn("Left gamemode but streaming was still running, stopping stream")
                     await Plugin.stop_streaming(self)
                     await Plugin.clear_rogue_gst_processes(self)
+                
+                # Check for process crash/exit (is_streaming already handles this, 
+                # but we also want to check stderr for connection errors)
+                if self._streaming_process is not None:
+                    # Check stderr for connection errors without blocking
+                    try:
+                        import select
+                        if hasattr(self._streaming_process, 'stderr') and self._streaming_process.stderr:
+                            # Non-blocking read check
+                            ready, _, _ = select.select([self._streaming_process.stderr], [], [], 0)
+                            if ready:
+                                line = self._streaming_process.stderr.readline()
+                                if line:
+                                    line_str = line.decode('utf-8', errors='ignore').strip()
+                                    # Check for connection-related errors
+                                    error_indicators = [
+                                        "Connection refused",
+                                        "Could not connect",
+                                        "Failed to connect",
+                                        "Connection timed out",
+                                        "Connection reset",
+                                        "Broken pipe",
+                                        "Network is unreachable",
+                                        "RTMP connection failed",
+                                        "rtmp2sink",
+                                        "ERROR",
+                                    ]
+                                    for indicator in error_indicators:
+                                        if indicator.lower() in line_str.lower():
+                                            logger.error(f"Stream connection error: {line_str}")
+                                            self._stream_error = True
+                                            self._last_error_message = line_str[:200]  # Truncate long messages
+                                            break
+                    except Exception as e:
+                        logger.debug(f"Error checking stderr: {e}")
                     
             except Exception as e:
                 logger.exception(f"Watchdog exception! {str(e)}")
@@ -263,6 +300,10 @@ class Plugin:
         """Start the RTMP streaming process"""
         try:
             logger.info("Starting stream")
+            
+            # Clear any previous error state
+            self._stream_error = False
+            self._last_error_message = ""
 
             if await Plugin.is_streaming(self):
                 logger.info("Error: Already streaming")
@@ -446,7 +487,41 @@ class Plugin:
 
     async def is_streaming(self, verbose=False):
         """Check if currently streaming"""
-        return self._streaming_process is not None
+        if self._streaming_process is None:
+            return False
+        
+        # Check if process is actually still running
+        poll_result = self._streaming_process.poll()
+        if poll_result is not None:
+            # Process has exited
+            exit_code = poll_result
+            if exit_code != 0:
+                logger.warning(f"Streaming process exited with code {exit_code}")
+                self._stream_error = True
+                self._last_error_message = f"Stream ended unexpectedly (exit code: {exit_code})"
+            
+            # Clean up
+            self._streaming_process = None
+            self._stream_start_time = None
+            await Plugin.cleanup_decky_pa_sink(self)
+            return False
+        
+        return True
+
+    async def get_stream_status(self):
+        """Get detailed stream status including any errors"""
+        is_active = await Plugin.is_streaming(self)
+        return {
+            "streaming": is_active,
+            "error": self._stream_error,
+            "error_message": self._last_error_message,
+            "duration": await Plugin.get_stream_duration(self) if is_active else 0
+        }
+
+    async def clear_stream_error(self):
+        """Clear stream error state"""
+        self._stream_error = False
+        self._last_error_message = ""
 
     async def get_stream_duration(self):
         """Get how long the current stream has been running"""

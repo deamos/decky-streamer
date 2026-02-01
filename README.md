@@ -106,7 +106,7 @@ The plugin includes built-in presets for these platforms:
 
 | Platform | RTMP URL (built-in) |
 |----------|---------------------|
-| Twitch | `rtmp://live.twitch.tv/app` |
+| Twitch | `rtmp://ingest.global-contribute.live-video.net/app` |
 | YouTube | `rtmp://a.rtmp.youtube.com/live2` |
 | Kick | `rtmp://fa723fc1b171.global-contribute.live-video.net/app` |
 | Facebook | `rtmps://live-api-s.facebook.com:443/rtmp` |

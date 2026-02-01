@@ -11,7 +11,9 @@ import {
   Router,
   ToggleField,
   SliderField,
-  TextField
+  TextField,
+  showModal,
+  ConfirmModal
 } from "decky-frontend-lib";
 
 import {
@@ -24,7 +26,7 @@ import { FaBroadcastTower } from "react-icons/fa";
 
 // Streaming platform presets
 const STREAMING_PLATFORMS = {
-  twitch: { name: "Twitch", url: "rtmp://live.twitch.tv/app" },
+  twitch: { name: "Twitch", url: "rtmp://ingest.global-contribute.live-video.net/app" },
   youtube: { name: "YouTube", url: "rtmp://a.rtmp.youtube.com/live2" },
   kick: { name: "Kick", url: "rtmp://fa723fc1b171.global-contribute.live-video.net/app" },
   facebook: { name: "Facebook", url: "rtmps://live-api-s.facebook.com:443/rtmp" },
@@ -128,8 +130,11 @@ class DeckyStreamerLogic {
 
 const DeckyStreamer: VFC<{ serverAPI: ServerAPI, logic: DeckyStreamerLogic }> = ({ serverAPI, logic }) => {
   const [isLoading, setIsLoading] = useState(true);
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const [isStreaming, setStreaming] = useState(false);
   const [streamDuration, setStreamDuration] = useState(0);
+  const [streamError, setStreamError] = useState(false);
+  const [streamErrorMessage, setStreamErrorMessage] = useState("");
   const [microphoneEnabled, setMicrophone] = useState(false);
   const [micGain, setMicGain] = useState(13);
   const [isEnhancedNoiseCancellation, setEnhancedNoiseCancellation] = useState(false);
@@ -260,6 +265,51 @@ const DeckyStreamer: VFC<{ serverAPI: ServerAPI, logic: DeckyStreamerLogic }> = 
     return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   };
 
+  // Text input modal component for cleaner keyboard handling
+  const TextInputModal = ({ title, currentValue, onSubmit, isPassword, closeModal }: {
+    title: string;
+    currentValue: string;
+    onSubmit: (value: string) => void;
+    isPassword: boolean;
+    closeModal?: () => void;
+  }) => {
+    const [value, setValue] = useState(currentValue);
+    
+    return (
+      <ConfirmModal
+        strTitle={title}
+        strDescription={isPassword ? "Enter your stream key" : "Enter the URL"}
+        onOK={() => {
+          onSubmit(value);
+          closeModal?.();
+        }}
+        onCancel={() => closeModal?.()}
+        bAllowFullSize={true}
+      >
+        <div style={{ padding: '10px 0' }}>
+          <TextField
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            bIsPassword={isPassword}
+            focusOnMount={true}
+          />
+        </div>
+      </ConfirmModal>
+    );
+  };
+
+  // Show text input modal using Steam's keyboard
+  const showTextInputModal = (title: string, currentValue: string, onSubmit: (value: string) => void, isPassword: boolean = false) => {
+    showModal(
+      <TextInputModal
+        title={title}
+        currentValue={currentValue}
+        onSubmit={onSubmit}
+        isPassword={isPassword}
+      />
+    );
+  };
+
   const streamButtonPress = async () => {
     if (!isStreaming) {
       const effectiveUrl = getEffectiveRtmpUrl();
@@ -271,6 +321,11 @@ const DeckyStreamer: VFC<{ serverAPI: ServerAPI, logic: DeckyStreamerLogic }> = 
         logic.notify("Error", 2000, "Please enter your stream key");
         return;
       }
+      // Clear any previous error state
+      setStreamError(false);
+      setStreamErrorMessage("");
+      await serverAPI.callPluginMethod('clear_stream_error', {});
+      
       setStreaming(true);
       const result = await serverAPI.callPluginMethod('start_streaming', {});
       if (result.result) {
@@ -285,6 +340,8 @@ const DeckyStreamer: VFC<{ serverAPI: ServerAPI, logic: DeckyStreamerLogic }> = 
     } else {
       await serverAPI.callPluginMethod('stop_streaming', {});
       setStreaming(false);
+      setStreamError(false);
+      setStreamErrorMessage("");
       logic.notify("Stream Ended", 1500, "Stream has been stopped");
     }
   };
@@ -333,19 +390,40 @@ const DeckyStreamer: VFC<{ serverAPI: ServerAPI, logic: DeckyStreamerLogic }> = 
   useEffect(() => {
     let interval: NodeJS.Timeout | null = null;
     
-    if (isStreaming) {
-      interval = setInterval(async () => {
-        const duration = await serverAPI.callPluginMethod('get_stream_duration', {});
-        setStreamDuration(duration.result as number);
-      }, 1000);
-    } else {
+    // Poll for stream status every second when streaming, every 2 seconds otherwise
+    const pollInterval = isStreaming ? 1000 : 2000;
+    
+    interval = setInterval(async () => {
+      const status = await serverAPI.callPluginMethod('get_stream_status', {});
+      const statusResult = status.result as { streaming: boolean; error: boolean; error_message: string; duration: number } | null;
+      
+      if (statusResult) {
+        // Update streaming state if it changed (e.g., process crashed)
+        if (statusResult.streaming !== isStreaming) {
+          setStreaming(statusResult.streaming);
+        }
+        
+        // Update duration
+        setStreamDuration(statusResult.duration);
+        
+        // Handle errors
+        if (statusResult.error && !streamError) {
+          setStreamError(true);
+          setStreamErrorMessage(statusResult.error_message || "Stream connection lost");
+          logic.notify("Stream Error", 5000, statusResult.error_message || "Stream connection lost");
+        }
+      }
+    }, pollInterval);
+
+    // Reset duration when not streaming
+    if (!isStreaming) {
       setStreamDuration(0);
     }
 
     return () => {
       if (interval) clearInterval(interval);
     };
-  }, [isStreaming, serverAPI]);
+  }, [isStreaming, serverAPI, streamError, logic]);
 
   useEffect(() => {
     initState();
@@ -385,6 +463,14 @@ const DeckyStreamer: VFC<{ serverAPI: ServerAPI, logic: DeckyStreamerLogic }> = 
             </div>
           </PanelSectionRow>
         )}
+
+        {streamError && !isStreaming && (
+          <PanelSectionRow>
+            <div style={{ textAlign: 'center', color: '#ffaa00', padding: '8px', backgroundColor: 'rgba(255, 170, 0, 0.1)', borderRadius: '4px' }}>
+              ⚠️ Stream ended: {streamErrorMessage || "Connection lost"}
+            </div>
+          </PanelSectionRow>
+        )}
       </PanelSection>
 
       <PanelSection title="Stream Settings">
@@ -406,37 +492,43 @@ const DeckyStreamer: VFC<{ serverAPI: ServerAPI, logic: DeckyStreamerLogic }> = 
         {selectedPlatform === "custom" && (
           <>
             <PanelSectionRow>
-              <TextField
-                label="RTMP URL"
-                value={customRtmpUrl}
+              <ButtonItem
+                layout="below"
                 disabled={isStreaming}
-                onChange={async (e) => {
-                  const value = e.target.value;
-                  setCustomRtmpUrl(value);
-                  await serverAPI.callPluginMethod('set_custom_rtmp_url', { rtmp_url: value });
-                  await serverAPI.callPluginMethod('set_rtmp_url', { rtmp_url: value });
+                onClick={() => {
+                  showTextInputModal("RTMP URL", customRtmpUrl, async (value) => {
+                    setCustomRtmpUrl(value);
+                    await serverAPI.callPluginMethod('set_custom_rtmp_url', { rtmp_url: value });
+                    await serverAPI.callPluginMethod('set_rtmp_url', { rtmp_url: value });
+                  });
                 }}
-              />
+              >
+                {customRtmpUrl 
+                  ? (customRtmpUrl.length > 30 ? customRtmpUrl.slice(0, 30) + "..." : customRtmpUrl)
+                  : "Tap to enter RTMP URL..."}
+              </ButtonItem>
             </PanelSectionRow>
             <PanelSectionRow>
               <div style={{ fontSize: '12px', color: '#888' }}>
-                Enter your custom RTMP server URL
+                Tap to enter your custom RTMP server URL
               </div>
             </PanelSectionRow>
           </>
         )}
 
         <PanelSectionRow>
-          <TextField
-            label="Stream Key"
-            value={streamKey}
+          <ButtonItem
+            layout="below"
             disabled={isStreaming}
-            onChange={async (e) => {
-              const value = e.target.value;
-              setStreamKey(value);
-              await serverAPI.callPluginMethod('set_stream_key', { stream_key: value });
+            onClick={() => {
+              showTextInputModal("Stream Key", streamKey, async (value) => {
+                setStreamKey(value);
+                await serverAPI.callPluginMethod('set_stream_key', { stream_key: value });
+              }, true);
             }}
-          />
+          >
+            {streamKey ? "••••••••••••" : "Tap to enter Stream Key..."}
+          </ButtonItem>
         </PanelSectionRow>
         <PanelSectionRow>
           <div style={{ fontSize: '12px', color: '#888' }}>
@@ -571,6 +663,34 @@ const DeckyStreamer: VFC<{ serverAPI: ServerAPI, logic: DeckyStreamerLogic }> = 
             </PanelSectionRow>
           </>
         )}
+
+        <PanelSectionRow>
+          <ButtonItem
+            layout="below"
+            disabled={isStreaming || isRefreshing}
+            onClick={async () => {
+              setIsRefreshing(true);
+              try {
+                // Force reload from backend
+                await serverAPI.callPluginMethod('loadConfig', {});
+                // Small delay to ensure backend has loaded
+                await new Promise(resolve => setTimeout(resolve, 100));
+                // Reload all state
+                await initState();
+                logic.notify("Settings Refreshed", 1500, "Settings reloaded from config");
+              } finally {
+                setIsRefreshing(false);
+              }
+            }}
+          >
+            {isRefreshing ? "⏳ Refreshing..." : "🔄 Refresh Settings"}
+          </ButtonItem>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <div style={{ fontSize: '12px', color: '#888' }}>
+            Reload settings from config file
+          </div>
+        </PanelSectionRow>
       </PanelSection>
 
       <PanelSection title="Microphone">

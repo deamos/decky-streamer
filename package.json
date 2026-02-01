@@ -1,6 +1,6 @@
 {
   "name": "decky-streamer",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Stream your Steam Deck gameplay to RTMP endpoints like Twitch, YouTube, etc.",
   "scripts": {
     "build": "shx rm -rf dist && rollup -c",
