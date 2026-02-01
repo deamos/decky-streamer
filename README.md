@@ -10,7 +10,7 @@ Based on [decky-recorder-fork](https://github.com/SDH-Stewardship/decky-recorder
 - **Hardware-accelerated H.264 encoding** using VAAPI for efficient streaming
 - **Configurable video settings**:
   - Bitrate: 1000-8000 kbps
-  - Resolution: 720p or 1080p
+  - Resolution: Native (auto-detected), 720p, 800p, or 1080p
   - Framerate: 30 or 60 fps
 - **Audio settings**:
   - Bitrate options: 96, 128, 160, 192, or 256 kbps
@@ -24,11 +24,13 @@ Based on [decky-recorder-fork](https://github.com/SDH-Stewardship/decky-recorder
 ## Requirements
 
 - Steam Deck with Decky Loader installed
-- Steam's Game Recording feature enabled (Settings → Game Recording → Enable)
-- Node.js 18+ (for building)
-- pnpm
-- Docker (for backend build)
-- jq
+- Node.js 18+ (for building from source)
+- pnpm (for building from source)
+- Docker (for building from source)
+- jq (for building from source)
+
+## Screenshot
+![Decky-Streamer Example Screenshot](decky-streamer-screenshot.jpeg)
 
 ## Installation
 
@@ -78,15 +80,11 @@ make it
 
 ## Usage
 
-1. **Enable Game Recording** on your Steam Deck:
-   - Go to Steam Settings → Game Recording
-   - Enable game recording (this provides the video source for streaming)
+1. Open the Decky menu on your Steam Deck
 
-2. Open the Decky menu on your Steam Deck
+2. Find "Decky Streamer" in the plugin list
 
-3. Find "Decky Streamer" in the plugin list
-
-4. Configure your stream settings:
+3. Configure your stream settings:
    - **Platform**: Select your streaming platform (Twitch, YouTube, etc.) or "Custom" for other RTMP servers
    - **Stream Key**: Your secret stream key from your streaming platform's dashboard
    - **Video Bitrate**: Higher = better quality but more bandwidth
@@ -96,11 +94,11 @@ make it
    - **Framerate**: 60 fps for smooth gameplay, 30 fps for lower bandwidth
    - **Audio Bitrate**: 160 kbps is a good default
 
-5. (Optional) Enable "Show Advanced Options" for:
+4. (Optional) Enable "Show Advanced Options" for:
    - **Keyframe Interval**: Controls how often full frames are sent (affects seeking/quality)
    - **B-Frames**: Improves compression quality but adds slight latency
 
-6. Press "Start Streaming" to go live!
+5. Press "Start Streaming" to go live!
 
 ## Platform RTMP URLs
 
@@ -137,13 +135,12 @@ After installing, restart the microphone toggle to see noise reduction options.
 ## Troubleshooting
 
 ### Stream won't start
-- **Enable Game Recording**: Go to Steam Settings → Game Recording and enable it. This is required for video capture.
 - Verify your stream key is correct
 - Check that your platform's RTMP URL is accessible
 - Ensure you have a stable internet connection
+- Check the plugin logs at `~/homebrew/logs/decky-streamer/`
 
 ### Black screen / No video
-- Make sure Steam's Game Recording is enabled
 - Try restarting the stream
 - Check the plugin logs at `~/homebrew/logs/decky-streamer/`
 

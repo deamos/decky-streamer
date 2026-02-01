@@ -90,9 +90,6 @@ jobs:
             2. Extract and copy the `decky-streamer` folder to `~/homebrew/plugins/`
             3. Restart Decky Loader or reboot your Steam Deck
             
-            ## Requirements
-            - Steam's Game Recording must be enabled (Settings > System > Enable Game Recording)
-            
             See the [README](https://github.com/${{ github.repository }}/blob/master/README.md) for full documentation.
             
             ---

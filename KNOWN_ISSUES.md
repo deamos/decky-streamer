@@ -1,0 +1,1 @@
+- Decky-Streamer may stop streaming when starting up with Waydroid and require a reboot to fix

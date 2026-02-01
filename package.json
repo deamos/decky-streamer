@@ -22,7 +22,7 @@
     "youtube"
   ],
   "author": "Deamos",
-  "license": "MIT",
+  "license": "BSD-3-Clause",
   "devDependencies": {
     "@rollup/plugin-commonjs": "^21.1.0",
     "@rollup/plugin-json": "^4.1.0",
