@@ -120,6 +120,7 @@ PLATFORM_URLS = {
 # Resolution presets (width, height)
 RESOLUTION_PRESETS = {
     "720p": {"width": 1280, "height": 720},
+    "800p": {"width": 1280, "height": 800},  # Steam Deck native
     "1080p": {"width": 1920, "height": 1080},
     "native": {"width": 0, "height": 0}  # 0 means no scaling
 }
@@ -145,6 +146,47 @@ def get_video_scale_caps(resolution):
     if preset["width"] == 0:
         return ""
     return f"video/x-raw,width={preset['width']},height={preset['height']}"
+
+
+def detect_display_resolution():
+    """Detect the current display resolution using xrandr"""
+    # Try displays in order: :0 (works when docked), :1 (game display in handheld)
+    displays_to_try = [":0", ":1"]
+    
+    for display in displays_to_try:
+        try:
+            env = os.environ.copy()
+            env.pop('LD_LIBRARY_PATH', None)
+            env.pop('LD_PRELOAD', None)
+            env['DISPLAY'] = display
+            
+            # Try xrandr first
+            result = subprocess.run(
+                "xrandr | grep '*' | awk '{print $1}'",
+                shell=True, capture_output=True, text=True, env=env
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                # Parse resolution like "1280x800"
+                res = result.stdout.strip().split('\n')[0]
+                if 'x' in res:
+                    width, height = res.split('x')
+                    return {"width": int(width), "height": int(height), "display": display}
+            
+            # Fallback to xdpyinfo
+            result = subprocess.run(
+                "xdpyinfo | grep dimensions | awk '{print $2}'",
+                shell=True, capture_output=True, text=True, env=env
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                res = result.stdout.strip()
+                if 'x' in res:
+                    width, height = res.split('x')
+                    return {"width": int(width), "height": int(height), "display": display}
+        except Exception as e:
+            logger.debug(f"Could not detect display resolution on {display}: {e}")
+    
+    # Default to Steam Deck native
+    return {"width": 1280, "height": 800, "display": "default"}
 
 
 class Plugin:
@@ -583,6 +625,11 @@ class Plugin:
     async def set_resolution(self, resolution: str):
         self._resolution = resolution
         await Plugin.saveConfig(self)
+
+    async def get_detected_resolution(self):
+        """Get the current display resolution"""
+        res = detect_display_resolution()
+        return f"{res['width']}x{res['height']}"
 
     async def get_framerate(self):
         return self._framerate

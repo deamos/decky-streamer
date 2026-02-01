@@ -37,10 +37,11 @@ const PLATFORM_OPTIONS: DropdownOption[] = Object.entries(STREAMING_PLATFORMS).m
   label: value.name
 } as SingleDropdownOption));
 
-// Resolution options (defined outside component for stable reference)
-// Note: Native option removed as it can cause encoder issues
-const RESOLUTION_OPTIONS: DropdownOption[] = [
+// Base resolution options (native will be added dynamically with detected resolution)
+const BASE_RESOLUTION_OPTIONS: DropdownOption[] = [
+  { data: "native", label: "Native (Display)" } as SingleDropdownOption,
   { data: "720p", label: "720p (1280x720)" } as SingleDropdownOption,
+  { data: "800p", label: "800p (1280x800)" } as SingleDropdownOption,
   { data: "1080p", label: "1080p (1920x1080)" } as SingleDropdownOption
 ];
 
@@ -149,6 +150,17 @@ const DeckyStreamer: VFC<{ serverAPI: ServerAPI, logic: DeckyStreamerLogic }> = 
   const [keyframeInterval, setKeyframeInterval] = useState(0);
   const [bframes, setBframes] = useState(0);
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [detectedResolution, setDetectedResolution] = useState("");
+
+  // Build resolution options with dynamic native label
+  const getResolutionOptions = (): DropdownOption[] => {
+    return BASE_RESOLUTION_OPTIONS.map(opt => {
+      if (opt.data === "native" && detectedResolution) {
+        return { data: "native", label: `Native (${detectedResolution})` } as SingleDropdownOption;
+      }
+      return opt;
+    });
+  };
 
   // Get the effective RTMP URL based on selection
   const getEffectiveRtmpUrl = (): string => {
@@ -213,7 +225,7 @@ const DeckyStreamer: VFC<{ serverAPI: ServerAPI, logic: DeckyStreamerLogic }> = 
       const getResolution = await serverAPI.callPluginMethod('get_resolution', {});
       const resolutionResult = getResolution.result as string;
       // Ensure it's a valid option
-      const validResolutions = ["720p", "1080p"];
+      const validResolutions = ["native", "720p", "800p", "1080p"];
       setSelectedResolution(validResolutions.includes(resolutionResult) ? resolutionResult : "720p");
 
       const getFramerate = await serverAPI.callPluginMethod('get_framerate', {});
@@ -232,6 +244,10 @@ const DeckyStreamer: VFC<{ serverAPI: ServerAPI, logic: DeckyStreamerLogic }> = 
       const bframesResult = getBframes.result as number;
       const validBframes = [0, 1, 2, 3];
       setBframes(validBframes.includes(bframesResult) ? bframesResult : 0);
+
+      // Get detected display resolution
+      const getDetectedRes = await serverAPI.callPluginMethod('get_detected_resolution', {});
+      setDetectedResolution(getDetectedRes.result as string || "");
     } finally {
       setIsLoading(false);
     }
@@ -451,9 +467,9 @@ const DeckyStreamer: VFC<{ serverAPI: ServerAPI, logic: DeckyStreamerLogic }> = 
 
         <PanelSectionRow>
           <Dropdown
-            rgOptions={RESOLUTION_OPTIONS}
-            selectedOption={getSelectedOption(RESOLUTION_OPTIONS, selectedResolution)}
-            strDefaultLabel={getSelectedOption(RESOLUTION_OPTIONS, selectedResolution).label as string}
+            rgOptions={getResolutionOptions()}
+            selectedOption={getSelectedOption(getResolutionOptions(), selectedResolution)}
+            strDefaultLabel={getSelectedOption(getResolutionOptions(), selectedResolution).label as string}
             disabled={isStreaming}
             onChange={(newResolution) => {
               const value = newResolution.data as string;
