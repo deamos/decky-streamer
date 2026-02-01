@@ -83,21 +83,22 @@ jobs:
           tag_name: v${{ steps.version.outputs.version }}
           name: Decky Streamer v${{ steps.version.outputs.version }}
           body: |
-            ## Decky Streamer v${{ steps.version.outputs.version }}
-            
             Stream your Steam Deck gameplay to RTMP endpoints like Twitch, YouTube, Kick, and more!
             
-            ### Installation
+            ## Installation
             1. Download `decky-streamer.zip`
             2. Extract and copy the `decky-streamer` folder to `~/homebrew/plugins/`
             3. Restart Decky Loader or reboot your Steam Deck
             
-            ### Requirements
+            ## Requirements
             - Steam's Game Recording must be enabled (Settings > System > Enable Game Recording)
             
             See the [README](https://github.com/${{ github.repository }}/blob/master/README.md) for full documentation.
+            
+            ---
           files: decky-streamer.zip
           draft: false
           prerelease: false
+          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
