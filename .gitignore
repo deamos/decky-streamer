@@ -1,0 +1,44 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build outputs
+dist/
+tmp/
+backend/out/
+bin/
+*.zip
+
+# Environment and secrets
+.env
+.env.local
+
+# Logs
+*.log
+decky-streamer*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.so
+.eggs/
+*.egg-info/
+*.egg
+.venv/
+venv/
+
+# Lock files (optional - some prefer to commit these)
+# pnpm-lock.yaml

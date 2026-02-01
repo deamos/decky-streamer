@@ -1,0 +1,10 @@
+{
+  "name": "Decky Streamer",
+  "author": "Deamos",
+  "flags": ["debug"],
+  "publish": {
+    "tags": ["Streaming", "Capture"],
+    "description": "Stream your Steam Deck gameplay to RTMP endpoints like Twitch, YouTube, etc.",
+    "image": ""
+  }
+}
