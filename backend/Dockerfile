@@ -1,14 +1,15 @@
 FROM ghcr.io/steamdeckhomebrew/holo-base:latest
 
 # Install GStreamer packages with RTMP support
-# gst-plugins-bad includes rtmp2 elements for better RTMP support
+# gst-plugins-bad provides libgstrtmp.so; on Arch the librtmp library comes from the rtmpdump package
 RUN mkdir /pacman && pacman -Sydd --noconfirm --root /pacman --dbpath /var/lib/pacman \
     gstreamer-vaapi \
     gst-plugin-pipewire \
     gst-plugins-bad \
     gst-plugins-bad-libs \
     gst-plugins-good \
-    gst-libav
+    gst-libav \
+    rtmpdump
 
 # Remove unnecessary plugins to reduce size
 RUN cd /pacman/usr/lib/gstreamer-1.0/ && rm -f \

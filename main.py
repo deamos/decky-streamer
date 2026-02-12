@@ -140,6 +140,35 @@ def build_rtmp_url(platform, custom_url, stream_key):
     return url
 
 
+RTMP_MISSING_MESSAGE = (
+    "RTMP plugin not available (missing librtmp). "
+    "On SteamOS: open Konsole and run: sudo steamos-readonly disable && sudo pacman -S rtmpdump && sudo steamos-readonly enable"
+)
+
+
+def _streaming_env():
+    """Build env for GStreamer subprocess: use plugin's bin for libs (e.g. librtmp)."""
+    env = os.environ.copy()
+    env.pop("LD_PRELOAD", None)
+    # Prepend plugin bin so bundled librtmp (and other deps) are found when loading libgstrtmp
+    env["LD_LIBRARY_PATH"] = str(DEPSPATH)
+    env["GST_PLUGIN_PATH"] = str(GSTPLUGINSPATH)
+    return env
+
+
+def _check_rtmpsink_available():
+    """Return True if GStreamer rtmpsink element is available (librtmp loaded)."""
+    env = _streaming_env()
+    result = subprocess.run(
+        ["gst-inspect-1.0", "rtmpsink"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    return result.returncode == 0
+
+
 def get_video_scale_caps(resolution):
     """Get the video scaling caps filter based on resolution preset"""
     preset = RESOLUTION_PRESETS.get(resolution, RESOLUTION_PRESETS["720p"])
@@ -192,6 +221,16 @@ def detect_display_resolution():
 class Plugin:
     _streaming_process = None
     _platform: str = "twitch"  # twitch, youtube, kick, facebook, custom
+
+    @staticmethod
+    def _friendly_error_from_stderr(stderr_content):
+        """Parse GStreamer stderr and return a short user-facing message for known issues."""
+        if not stderr_content:
+            return ""
+        s = stderr_content.lower()
+        if ("rtmpsink" in s and ("no element" in s or "erroneous pipeline" in s)) or "librtmp" in s or "libgstrtmp" in s:
+            return RTMP_MISSING_MESSAGE
+        return ""
     _rtmpUrl: str = ""
     _customRtmpUrl: str = ""
     _streamKey: str = ""
@@ -347,6 +386,13 @@ class Plugin:
             rtmp_full_url = build_rtmp_url(self._platform, self._customRtmpUrl, self._streamKey)
             logger.info(f"Streaming to platform: {self._platform} (key hidden)")
 
+            # Fail fast if rtmpsink (librtmp) is not available
+            if not _check_rtmpsink_available():
+                logger.error("rtmpsink not available (librtmp missing)")
+                self._stream_error = True
+                self._last_error_message = RTMP_MISSING_MESSAGE
+                return False
+
             # Get video scaling
             scale_caps = get_video_scale_caps(self._resolution)
             
@@ -424,28 +470,46 @@ class Plugin:
                 + f'mux.'
             )
 
-            # Start the streaming process
+            # Start the streaming process (use plugin bin for LD_LIBRARY_PATH so bundled librtmp is found)
             logger.info("Command: " + cmd)
-            # Clear LD_LIBRARY_PATH to avoid conflicts with system libraries
-            env = os.environ.copy()
-            env.pop('LD_LIBRARY_PATH', None)
-            env.pop('LD_PRELOAD', None)
+            env = _streaming_env()
             self._streaming_process = subprocess.Popen(cmd, shell=True, stdout=std_out_file, stderr=std_err_file, env=env)
             
             # Wait a moment and check if process is still running
             await asyncio.sleep(1)
-            if self._streaming_process.poll() is not None:
-                # Process exited immediately - something went wrong
-                exit_code = self._streaming_process.returncode
-                logger.error(f"GStreamer exited immediately with code {exit_code}")
-                # Read stderr to see what went wrong
+            # Process may have exited already; another task (e.g. status poll) may have set _streaming_process to None
+            proc = self._streaming_process
+            if proc is None:
+                # Already cleared by another task (process exited quickly)
+                logger.error("GStreamer process exited before startup check")
+                self._stream_error = True
                 try:
                     std_err_file.flush()
                     with open(std_err_file_path, 'r') as f:
                         stderr_content = f.read()
+                        self._last_error_message = self._friendly_error_from_stderr(stderr_content)
+                        if stderr_content and not self._last_error_message:
+                            logger.error(f"GStreamer stderr: {stderr_content[:2000]}")
+                except Exception as read_err:
+                    self._last_error_message = "Stream ended unexpectedly (see decky-streamer-std-err.log)"
+                    logger.error(f"Could not read stderr: {read_err}")
+                await Plugin.cleanup_decky_pa_sink(self)
+                return False
+            if proc.poll() is not None:
+                # Process exited immediately - something went wrong
+                exit_code = proc.returncode
+                logger.error(f"GStreamer exited immediately with code {exit_code}")
+                self._stream_error = True
+                try:
+                    std_err_file.flush()
+                    with open(std_err_file_path, 'r') as f:
+                        stderr_content = f.read()
+                        _parse_err = getattr(Plugin, "_friendly_error_from_stderr")
+                        self._last_error_message = _parse_err(stderr_content) or f"Stream ended unexpectedly (exit code: {exit_code})"
                         if stderr_content:
                             logger.error(f"GStreamer stderr: {stderr_content[:2000]}")
                 except Exception as read_err:
+                    self._last_error_message = f"Stream ended unexpectedly (exit code: {exit_code})"
                     logger.error(f"Could not read stderr: {read_err}")
                 self._streaming_process = None
                 await Plugin.cleanup_decky_pa_sink(self)
