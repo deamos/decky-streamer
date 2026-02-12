@@ -1,1 +1,3 @@
 - Decky-Streamer may stop streaming when starting up with Waydroid and require a reboot to fix
+
+- **"RTMP plugin not available" / "no element rtmpsink"**: New builds bundle the RTMP library (from the rtmpdump package) and set `LD_LIBRARY_PATH` so it is used. If you see this on an older install, update the plugin. If it persists, install the system package (e.g. on SteamOS: `sudo steamos-readonly disable && sudo pacman -S rtmpdump && sudo steamos-readonly enable`).
