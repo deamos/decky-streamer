@@ -471,9 +471,13 @@ class Plugin:
             )
 
             # Start the streaming process (use plugin bin for LD_LIBRARY_PATH so bundled librtmp is found)
+            # start_new_session=True so we can kill the whole process group on timeout (shell + gst-launch)
             logger.info("Command: " + cmd)
             env = _streaming_env()
-            self._streaming_process = subprocess.Popen(cmd, shell=True, stdout=std_out_file, stderr=std_err_file, env=env)
+            self._streaming_process = subprocess.Popen(
+                cmd, shell=True, stdout=std_out_file, stderr=std_err_file, env=env,
+                start_new_session=True,
+            )
             
             # Wait a moment and check if process is still running
             await asyncio.sleep(1)
@@ -541,10 +545,24 @@ class Plugin:
         
         try:
             proc.wait(timeout=10)
-        except Exception:
+        except (subprocess.TimeoutExpired, Exception):
             logger.warn("Could not interrupt gstreamer, killing instead")
+            try:
+                proc.terminate()
+                proc.wait(timeout=3)
+            except (subprocess.TimeoutExpired, Exception):
+                try:
+                    pgid = os.getpgid(proc.pid)
+                    os.killpg(pgid, signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    pass
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
             await Plugin.clear_rogue_gst_processes(self)
-            
+            # Allow PipeWire/VAAPI to release resources after hard kill
+            await asyncio.sleep(1)
         logger.info("Waiting finished. Streaming stopped!")
         await Plugin.cleanup_decky_pa_sink(self)
         return
