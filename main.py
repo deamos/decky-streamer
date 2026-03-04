@@ -306,6 +306,11 @@ class Plugin:
     _recovery_pending: bool = False
     _capture_backend_preference: str = "pipewire"  # pipewire | ximagesrc
     _recovery_attempts: int = 0
+    _reconnect_active: bool = False
+    _reconnect_started_at: float = 0.0
+    _reconnect_next_attempt_at: float = 0.0
+    _reconnect_attempts: int = 0
+    _reconnect_grace_seconds: int = 90
     
 
     async def get_wakeup_count(self):
@@ -322,6 +327,45 @@ class Plugin:
                 logger.info(f"Killing rogue process {pid}")
                 os.kill(pid, signal.SIGKILL)
 
+    def _clear_reconnect_state(self):
+        self._reconnect_active = False
+        self._reconnect_started_at = 0.0
+        self._reconnect_next_attempt_at = 0.0
+        self._reconnect_attempts = 0
+
+    def _schedule_reconnect(self, reason: str, force_delay: int = None):
+        now = time.time()
+        if not self._reconnect_active:
+            self._reconnect_active = True
+            self._reconnect_started_at = now
+            self._reconnect_attempts = 0
+
+        elapsed = now - self._reconnect_started_at
+        if elapsed >= self._reconnect_grace_seconds:
+            self._recovery_pending = False
+            self._clear_reconnect_state()
+            self._stream_error = True
+            self._last_error_message = (
+                f"Stream could not recover after {self._reconnect_grace_seconds}s "
+                f"(last reason: {reason})"
+            )
+            logger.error(
+                f"[stream:{self._stream_session_id}] reconnect grace exceeded ({elapsed:.1f}s), giving up"
+            )
+            return False
+
+        backoff_steps = [1, 2, 4, 8, 10]
+        delay = force_delay if force_delay is not None else backoff_steps[min(self._reconnect_attempts, len(backoff_steps) - 1)]
+        self._reconnect_attempts += 1
+        self._reconnect_next_attempt_at = now + delay
+        self._recovery_pending = True
+        self._stream_error = False
+        self._last_error_message = ""
+        logger.warning(
+            f"[stream:{self._stream_session_id}] scheduling reconnect attempt={self._reconnect_attempts} in {delay}s (reason: {reason})"
+        )
+        return True
+
     async def watchdog(self):
         logger.info("Watchdog started")
         while True:
@@ -337,12 +381,17 @@ class Plugin:
                     await Plugin.clear_rogue_gst_processes(self)
                 
                 if self._recovery_pending and not is_streaming:
+                    now = time.time()
+                    if now < self._reconnect_next_attempt_at:
+                        await asyncio.sleep(1)
+                        continue
                     logger.warning(
                         f"[stream:{self._stream_session_id}] recovery pending, restarting with backend={self._capture_backend_preference}"
                     )
                     self._recovery_pending = False
-                    await asyncio.sleep(1)
-                    await Plugin.start_streaming(self)
+                    recovered = await Plugin.start_streaming(self)
+                    if not recovered and self._reconnect_active:
+                        self._schedule_reconnect("Reconnect attempt failed")
                     continue
                 
                 # Check for process crash/exit (is_streaming already handles this, 
@@ -395,6 +444,7 @@ class Plugin:
         try:
             logger.info("Starting stream")
             self._user_requested_stop = False
+            self._recovery_pending = False
             
             # Clear any previous error state
             self._stream_error = False
@@ -612,6 +662,7 @@ class Plugin:
             
             self._stream_start_time = time.time()
             self._recovery_attempts = 0
+            self._clear_reconnect_state()
             logger.info("Streaming started!")
             return True
             
@@ -626,6 +677,11 @@ class Plugin:
         logger.info("Stopping stream")
         self._user_requested_stop = True
         self._recovery_pending = False
+        if self._streaming_process is None and self._reconnect_active:
+            logger.info("Cancelling active reconnect loop")
+            self._clear_reconnect_state()
+            self._stream_start_time = None
+            return
         if await Plugin.is_streaming(self) == False:
             logger.info("Error: No streaming process to stop")
             return
@@ -664,6 +720,9 @@ class Plugin:
     async def is_streaming(self, verbose=False):
         """Check if currently streaming"""
         if self._streaming_process is None:
+            # Keep UI in LIVE state while reconnect loop is active.
+            if self._reconnect_active:
+                return True
             return False
         
         # Check if process is actually still running
@@ -675,8 +734,6 @@ class Plugin:
                 logger.warning(
                     f"[stream:{self._stream_session_id}] Streaming process exited with code {exit_code}"
                 )
-                self._stream_error = True
-                self._last_error_message = f"Stream ended unexpectedly (exit code: {exit_code})"
                 stderr_tail = _tail_text(std_err_file_path)
                 logger.error(
                     f"[stream:{self._stream_session_id}] exit stderr tail:\n{stderr_tail}"
@@ -684,18 +741,21 @@ class Plugin:
                 logger.info(
                     f"[stream:{self._stream_session_id}] exit stdout tail:\n{_tail_text(std_out_file_path, line_count=20)}"
                 )
-                if (
+                if not self._user_requested_stop and exit_code == -13:
+                    if not self._schedule_reconnect("RTMP sink disconnected (SIGPIPE)"):
+                        self._last_error_message = "Stream ended after repeated RTMP disconnects"
+                elif (
                     not self._user_requested_stop
                     and _is_pipewire_stream_error(stderr_tail)
                     and self._recovery_attempts < 2
                 ):
                     self._capture_backend_preference = "ximagesrc"
-                    self._recovery_pending = True
                     self._recovery_attempts += 1
-                    self._last_error_message = "Capture failed (pipewire). Retrying with ximagesrc."
-                    logger.warning(
-                        f"[stream:{self._stream_session_id}] detected pipewire capture failure, scheduling auto-recovery attempt={self._recovery_attempts}"
-                    )
+                    if not self._schedule_reconnect("PipeWire capture failure", force_delay=1):
+                        self._last_error_message = "Stream ended after repeated capture failures"
+                else:
+                    self._stream_error = True
+                    self._last_error_message = f"Stream ended unexpectedly (exit code: {exit_code})"
             
             # Clean up
             self._streaming_process = None
