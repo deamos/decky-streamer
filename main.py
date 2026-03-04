@@ -178,6 +178,13 @@ def _tail_text(path: Path, line_count: int = 40):
         return ""
 
 
+def _is_pipewire_stream_error(stderr_tail: str):
+    if not stderr_tail:
+        return False
+    s = stderr_tail.lower()
+    return "gstpipewiresrc" in s and "reason error (-5)" in s
+
+
 RTMP_MISSING_MESSAGE = (
     "RTMP plugin not available (missing librtmp). "
     "On SteamOS: open Konsole and run: sudo steamos-readonly disable && sudo pacman -S rtmpdump && sudo steamos-readonly enable"
@@ -295,6 +302,10 @@ class Plugin:
     _stream_session_id: str = ""
     _stderr_last_mtime: float = 0.0
     _watchdog_tick: int = 0
+    _user_requested_stop: bool = False
+    _recovery_pending: bool = False
+    _capture_backend_preference: str = "pipewire"  # pipewire | ximagesrc
+    _recovery_attempts: int = 0
     
 
     async def get_wakeup_count(self):
@@ -324,6 +335,15 @@ class Plugin:
                     logger.warn("Left gamemode but streaming was still running, stopping stream")
                     await Plugin.stop_streaming(self)
                     await Plugin.clear_rogue_gst_processes(self)
+                
+                if self._recovery_pending and not is_streaming:
+                    logger.warning(
+                        f"[stream:{self._stream_session_id}] recovery pending, restarting with backend={self._capture_backend_preference}"
+                    )
+                    self._recovery_pending = False
+                    await asyncio.sleep(1)
+                    await Plugin.start_streaming(self)
+                    continue
                 
                 # Check for process crash/exit (is_streaming already handles this, 
                 # but we also want to check stderr for connection errors)
@@ -392,6 +412,7 @@ class Plugin:
         """Start the RTMP streaming process"""
         try:
             logger.info("Starting stream")
+            self._user_requested_stop = False
             
             # Clear any previous error state
             self._stream_error = False
@@ -470,8 +491,8 @@ class Plugin:
             # Video bitrate in bits/second for GStreamer
             video_bitrate_bps = self._videoBitrate * 1000
 
-            # Use PipeWire for video capture (matches working script)
-            logger.info("Using pipewiresrc for video capture")
+            capture_backend = self._capture_backend_preference
+            logger.info(f"Using {capture_backend} for video capture")
             
             start_command = (
                 "GST_VAAPI_ALL_DRIVERS=1 GST_PLUGIN_PATH={} gst-launch-1.0 -e -vvv".format(
@@ -495,9 +516,13 @@ class Plugin:
             # Build framerate caps
             framerate_caps = f"video/x-raw,framerate={self._framerate}/1"
             
+            video_source = "pipewiresrc do-timestamp=true"
+            if capture_backend == "ximagesrc":
+                video_source = "ximagesrc use-damage=0 show-pointer=false do-timestamp=true"
+
             if scale_caps:
                 video_pipeline = (
-                    f"pipewiresrc do-timestamp=true ! "
+                    f"{video_source} ! "
                     f"videoconvert ! videoscale ! videorate ! {scale_caps},framerate={self._framerate}/1 ! queue ! "
                     f"vaapih264enc {encoder_opts} ! "
                     f"h264parse ! queue ! "
@@ -506,7 +531,7 @@ class Plugin:
                 )
             else:
                 video_pipeline = (
-                    f"pipewiresrc do-timestamp=true ! "
+                    f"{video_source} ! "
                     f"videoconvert ! videorate ! {framerate_caps} ! queue ! "
                     f"vaapih264enc {encoder_opts} ! "
                     f"h264parse ! queue ! "
@@ -604,6 +629,7 @@ class Plugin:
                 return False
             
             self._stream_start_time = time.time()
+            self._recovery_attempts = 0
             logger.info("Streaming started!")
             return True
             
@@ -616,6 +642,8 @@ class Plugin:
     async def stop_streaming(self):
         """Stop the streaming process"""
         logger.info("Stopping stream")
+        self._user_requested_stop = True
+        self._recovery_pending = False
         if await Plugin.is_streaming(self) == False:
             logger.info("Error: No streaming process to stop")
             return
@@ -667,12 +695,25 @@ class Plugin:
                 )
                 self._stream_error = True
                 self._last_error_message = f"Stream ended unexpectedly (exit code: {exit_code})"
+                stderr_tail = _tail_text(std_err_file_path)
                 logger.error(
-                    f"[stream:{self._stream_session_id}] exit stderr tail:\n{_tail_text(std_err_file_path)}"
+                    f"[stream:{self._stream_session_id}] exit stderr tail:\n{stderr_tail}"
                 )
                 logger.info(
                     f"[stream:{self._stream_session_id}] exit stdout tail:\n{_tail_text(std_out_file_path, line_count=20)}"
                 )
+                if (
+                    not self._user_requested_stop
+                    and _is_pipewire_stream_error(stderr_tail)
+                    and self._recovery_attempts < 2
+                ):
+                    self._capture_backend_preference = "ximagesrc"
+                    self._recovery_pending = True
+                    self._recovery_attempts += 1
+                    self._last_error_message = "Capture failed (pipewire). Retrying with ximagesrc."
+                    logger.warning(
+                        f"[stream:{self._stream_session_id}] detected pipewire capture failure, scheduling auto-recovery attempt={self._recovery_attempts}"
+                    )
             
             # Clean up
             self._streaming_process = None
