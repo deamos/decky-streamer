@@ -372,7 +372,8 @@ class Plugin:
             try:
                 self._watchdog_tick += 1
                 in_gm = in_gamemode()
-                is_streaming = await Plugin.is_streaming(self, verbose=False)
+                # For watchdog decisions, only treat an active gst process as "streaming".
+                is_streaming = await Plugin.is_streaming(self, verbose=False, include_reconnect=False)
                 
                 # Stop streaming if we leave game mode
                 if not in_gm and is_streaming:
@@ -430,7 +431,7 @@ class Plugin:
             prev_wakeup_count = await Plugin.get_wakeup_count(self)
             
             if wakeup_count > prev_wakeup_count + 1:
-                if await Plugin.is_streaming(self, verbose=False):
+                if await Plugin.is_streaming(self, verbose=False, include_reconnect=False):
                     await asyncio.sleep(1)
                     logger.warn("Wakeup from sleep detected, restarting stream")
                     await Plugin.stop_streaming(self)
@@ -450,7 +451,7 @@ class Plugin:
             self._stream_error = False
             self._last_error_message = ""
 
-            if await Plugin.is_streaming(self):
+            if await Plugin.is_streaming(self, include_reconnect=False):
                 logger.info("Error: Already streaming")
                 return False
 
@@ -717,11 +718,11 @@ class Plugin:
         await Plugin.cleanup_decky_pa_sink(self)
         return
 
-    async def is_streaming(self, verbose=False):
+    async def is_streaming(self, verbose=False, include_reconnect=True):
         """Check if currently streaming"""
         if self._streaming_process is None:
             # Keep UI in LIVE state while reconnect loop is active.
-            if self._reconnect_active:
+            if include_reconnect and self._reconnect_active:
                 return True
             return False
         
