@@ -370,24 +370,6 @@ class Plugin:
                                     logger.info(
                                         f"[stream:{self._stream_session_id}] stderr tail update:\n{tail}"
                                     )
-                                    error_indicators = [
-                                        "Connection refused",
-                                        "Could not connect",
-                                        "Failed to connect",
-                                        "Connection timed out",
-                                        "Connection reset",
-                                        "Broken pipe",
-                                        "Network is unreachable",
-                                        "RTMP connection failed",
-                                        "rtmpsink",
-                                        "error",
-                                    ]
-                                    lower_tail = tail.lower()
-                                    for indicator in error_indicators:
-                                        if indicator.lower() in lower_tail:
-                                            self._stream_error = True
-                                            self._last_error_message = indicator
-                                            break
                     except Exception as e:
                         logger.debug(f"[stream:{self._stream_session_id}] Error checking stderr tail: {e}")
                     
