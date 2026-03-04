@@ -343,7 +343,7 @@ class Plugin:
         elapsed = now - self._reconnect_started_at
         if elapsed >= self._reconnect_grace_seconds:
             self._recovery_pending = False
-            self._clear_reconnect_state()
+            Plugin._clear_reconnect_state(self)
             self._stream_error = True
             self._last_error_message = (
                 f"Stream could not recover after {self._reconnect_grace_seconds}s "
@@ -391,7 +391,7 @@ class Plugin:
                     self._recovery_pending = False
                     recovered = await Plugin.start_streaming(self)
                     if not recovered and self._reconnect_active:
-                        self._schedule_reconnect("Reconnect attempt failed")
+                        Plugin._schedule_reconnect(self, "Reconnect attempt failed")
                     continue
                 
                 # Check for process crash/exit (is_streaming already handles this, 
@@ -662,7 +662,7 @@ class Plugin:
             
             self._stream_start_time = time.time()
             self._recovery_attempts = 0
-            self._clear_reconnect_state()
+            Plugin._clear_reconnect_state(self)
             logger.info("Streaming started!")
             return True
             
@@ -679,7 +679,7 @@ class Plugin:
         self._recovery_pending = False
         if self._streaming_process is None and self._reconnect_active:
             logger.info("Cancelling active reconnect loop")
-            self._clear_reconnect_state()
+            Plugin._clear_reconnect_state(self)
             self._stream_start_time = None
             return
         if await Plugin.is_streaming(self) == False:
@@ -742,7 +742,7 @@ class Plugin:
                     f"[stream:{self._stream_session_id}] exit stdout tail:\n{_tail_text(std_out_file_path, line_count=20)}"
                 )
                 if not self._user_requested_stop and exit_code == -13:
-                    if not self._schedule_reconnect("RTMP sink disconnected (SIGPIPE)"):
+                    if not Plugin._schedule_reconnect(self, "RTMP sink disconnected (SIGPIPE)"):
                         self._last_error_message = "Stream ended after repeated RTMP disconnects"
                 elif (
                     not self._user_requested_stop
@@ -751,7 +751,7 @@ class Plugin:
                 ):
                     self._capture_backend_preference = "ximagesrc"
                     self._recovery_attempts += 1
-                    if not self._schedule_reconnect("PipeWire capture failure", force_delay=1):
+                    if not Plugin._schedule_reconnect(self, "PipeWire capture failure", force_delay=1):
                         self._last_error_message = "Stream ended after repeated capture failures"
                 else:
                     self._stream_error = True
