@@ -4,7 +4,9 @@ import traceback
 import subprocess
 import signal
 import time
+import json
 from pathlib import Path
+from urllib.parse import urlparse
 from settings import SettingsManager
 import decky_plugin
 import logging
@@ -140,6 +142,42 @@ def build_rtmp_url(platform, custom_url, stream_key):
     return url
 
 
+def _sanitize_rtmp_url(url: str):
+    """Return a safe diagnostic view of RTMP URL (no key/token values)."""
+    if not url:
+        return {"raw": "", "scheme": "", "host": "", "path_preview": "", "path_depth": 0}
+    parsed = urlparse(url)
+    path_parts = [p for p in parsed.path.split("/") if p]
+    preview_parts = path_parts[:2]
+    preview = "/".join(preview_parts)
+    if len(path_parts) > 2:
+        preview += "/..."
+    return {
+        "raw": f"{parsed.scheme}://{parsed.netloc}",
+        "scheme": parsed.scheme,
+        "host": parsed.netloc,
+        "path_preview": preview,
+        "path_depth": len(path_parts),
+    }
+
+
+def _tail_text(path: Path, line_count: int = 40):
+    """Read a small tail chunk from a log file."""
+    try:
+        if not path.exists():
+            return ""
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            end = f.tell()
+            read_size = min(end, 32768)
+            f.seek(end - read_size)
+            data = f.read().decode("utf-8", errors="ignore")
+        lines = data.splitlines()
+        return "\n".join(lines[-line_count:])
+    except Exception:
+        return ""
+
+
 RTMP_MISSING_MESSAGE = (
     "RTMP plugin not available (missing librtmp). "
     "On SteamOS: open Konsole and run: sudo steamos-readonly disable && sudo pacman -S rtmpdump && sudo steamos-readonly enable"
@@ -254,6 +292,9 @@ class Plugin:
     _stream_start_time = None
     _stream_error: bool = False
     _last_error_message: str = ""
+    _stream_session_id: str = ""
+    _stderr_last_mtime: float = 0.0
+    _watchdog_tick: int = 0
     
 
     async def get_wakeup_count(self):
@@ -274,6 +315,7 @@ class Plugin:
         logger.info("Watchdog started")
         while True:
             try:
+                self._watchdog_tick += 1
                 in_gm = in_gamemode()
                 is_streaming = await Plugin.is_streaming(self, verbose=False)
                 
@@ -286,17 +328,28 @@ class Plugin:
                 # Check for process crash/exit (is_streaming already handles this, 
                 # but we also want to check stderr for connection errors)
                 if self._streaming_process is not None:
-                    # Check stderr for connection errors without blocking
+                    # Periodically capture process health and stderr tail for postmortem diagnostics.
+                    if self._watchdog_tick % 5 == 0:
+                        try:
+                            proc = psutil.Process(self._streaming_process.pid)
+                            cpu_pct = proc.cpu_percent(interval=None)
+                            rss_mb = round(proc.memory_info().rss / (1024 * 1024), 1)
+                            logger.info(
+                                f"[stream:{self._stream_session_id}] health pid={proc.pid} cpu={cpu_pct:.1f}% rss={rss_mb}MB"
+                            )
+                        except Exception as proc_err:
+                            logger.debug(f"[stream:{self._stream_session_id}] health sample failed: {proc_err}")
+
                     try:
-                        import select
-                        if hasattr(self._streaming_process, 'stderr') and self._streaming_process.stderr:
-                            # Non-blocking read check
-                            ready, _, _ = select.select([self._streaming_process.stderr], [], [], 0)
-                            if ready:
-                                line = self._streaming_process.stderr.readline()
-                                if line:
-                                    line_str = line.decode('utf-8', errors='ignore').strip()
-                                    # Check for connection-related errors
+                        if std_err_file_path.exists():
+                            mtime = std_err_file_path.stat().st_mtime
+                            if mtime > self._stderr_last_mtime:
+                                self._stderr_last_mtime = mtime
+                                tail = _tail_text(std_err_file_path, line_count=12)
+                                if tail:
+                                    logger.info(
+                                        f"[stream:{self._stream_session_id}] stderr tail update:\n{tail}"
+                                    )
                                     error_indicators = [
                                         "Connection refused",
                                         "Could not connect",
@@ -306,17 +359,17 @@ class Plugin:
                                         "Broken pipe",
                                         "Network is unreachable",
                                         "RTMP connection failed",
-                                        "rtmp2sink",
-                                        "ERROR",
+                                        "rtmpsink",
+                                        "error",
                                     ]
+                                    lower_tail = tail.lower()
                                     for indicator in error_indicators:
-                                        if indicator.lower() in line_str.lower():
-                                            logger.error(f"Stream connection error: {line_str}")
+                                        if indicator.lower() in lower_tail:
                                             self._stream_error = True
-                                            self._last_error_message = line_str[:200]  # Truncate long messages
+                                            self._last_error_message = indicator
                                             break
                     except Exception as e:
-                        logger.debug(f"Error checking stderr: {e}")
+                        logger.debug(f"[stream:{self._stream_session_id}] Error checking stderr tail: {e}")
                     
             except Exception as e:
                 logger.exception(f"Watchdog exception! {str(e)}")
@@ -384,7 +437,25 @@ class Plugin:
 
             # Build the full RTMP URL
             rtmp_full_url = build_rtmp_url(self._platform, self._customRtmpUrl, self._streamKey)
-            logger.info(f"Streaming to platform: {self._platform} (key hidden)")
+            self._stream_session_id = str(int(time.time()))
+            safe_url = _sanitize_rtmp_url(rtmp_full_url)
+            safe_custom = _sanitize_rtmp_url(self._customRtmpUrl)
+            stream_config = {
+                "platform": self._platform,
+                "resolution": self._resolution,
+                "fps": self._framerate,
+                "video_kbps": self._videoBitrate,
+                "audio_kbps": self._audioBitrate,
+                "keyframe_interval": self._keyframeInterval,
+                "bframes": self._bframes,
+                "mic_enabled": self._micEnabled,
+                "stream_key_len": len(self._streamKey or ""),
+                "custom_url": safe_custom,
+                "effective_url": safe_url,
+            }
+            logger.info(
+                f"[stream:{self._stream_session_id}] start config: {json.dumps(stream_config, sort_keys=True)}"
+            )
 
             # Fail fast if rtmpsink (librtmp) is not available
             if not _check_rtmpsink_available():
@@ -472,11 +543,18 @@ class Plugin:
 
             # Start the streaming process (use plugin bin for LD_LIBRARY_PATH so bundled librtmp is found)
             # start_new_session=True so we can kill the whole process group on timeout (shell + gst-launch)
-            logger.info("Command: " + cmd)
+            redacted_cmd = cmd.replace(rtmp_full_url, f"{safe_url['raw']}/<redacted-key>")
+            logger.info(f"[stream:{self._stream_session_id}] Command: {redacted_cmd}")
             env = _streaming_env()
+            logger.info(
+                f"[stream:{self._stream_session_id}] env summary: LD_LIBRARY_PATH={env.get('LD_LIBRARY_PATH','')} GST_PLUGIN_PATH={env.get('GST_PLUGIN_PATH','')}"
+            )
             self._streaming_process = subprocess.Popen(
                 cmd, shell=True, stdout=std_out_file, stderr=std_err_file, env=env,
                 start_new_session=True,
+            )
+            logger.info(
+                f"[stream:{self._stream_session_id}] gst subprocess spawned pid={self._streaming_process.pid}"
             )
             
             # Wait a moment and check if process is still running
@@ -497,6 +575,9 @@ class Plugin:
                 except Exception as read_err:
                     self._last_error_message = "Stream ended unexpectedly (see decky-streamer-std-err.log)"
                     logger.error(f"Could not read stderr: {read_err}")
+                logger.error(
+                    f"[stream:{self._stream_session_id}] startup failure stderr tail:\n{_tail_text(std_err_file_path)}"
+                )
                 await Plugin.cleanup_decky_pa_sink(self)
                 return False
             if proc.poll() is not None:
@@ -515,6 +596,9 @@ class Plugin:
                 except Exception as read_err:
                     self._last_error_message = f"Stream ended unexpectedly (exit code: {exit_code})"
                     logger.error(f"Could not read stderr: {read_err}")
+                logger.error(
+                    f"[stream:{self._stream_session_id}] immediate exit stderr tail:\n{_tail_text(std_err_file_path)}"
+                )
                 self._streaming_process = None
                 await Plugin.cleanup_decky_pa_sink(self)
                 return False
@@ -578,9 +662,17 @@ class Plugin:
             # Process has exited
             exit_code = poll_result
             if exit_code != 0:
-                logger.warning(f"Streaming process exited with code {exit_code}")
+                logger.warning(
+                    f"[stream:{self._stream_session_id}] Streaming process exited with code {exit_code}"
+                )
                 self._stream_error = True
                 self._last_error_message = f"Stream ended unexpectedly (exit code: {exit_code})"
+                logger.error(
+                    f"[stream:{self._stream_session_id}] exit stderr tail:\n{_tail_text(std_err_file_path)}"
+                )
+                logger.info(
+                    f"[stream:{self._stream_session_id}] exit stdout tail:\n{_tail_text(std_out_file_path, line_count=20)}"
+                )
             
             # Clean up
             self._streaming_process = None
