@@ -214,6 +214,42 @@ def _check_rtmpsink_available():
     return result.returncode == 0
 
 
+_GST_INSPECT_CACHE = {}
+
+
+def _gst_inspect_output(element: str):
+    """Return cached gst-inspect output for an element, or empty if unavailable."""
+    if element in _GST_INSPECT_CACHE:
+        return _GST_INSPECT_CACHE[element]
+    env = _streaming_env()
+    result = subprocess.run(
+        ["gst-inspect-1.0", element],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    out = result.stdout if result.returncode == 0 else ""
+    _GST_INSPECT_CACHE[element] = out
+    return out
+
+
+def _gst_has_element(element: str):
+    return bool(_gst_inspect_output(element))
+
+
+def _gst_element_has_property(element: str, prop: str):
+    out = _gst_inspect_output(element)
+    if not out:
+        return False
+    # gst-inspect uses "prop-name : Type" in the "Element Properties" section.
+    needle = f"{prop} "
+    for line in out.splitlines():
+        if line.strip().startswith(needle) and ":" in line:
+            return True
+    return False
+
+
 def get_video_scale_caps(resolution):
     """Get the video scaling caps filter based on resolution preset"""
     preset = RESOLUTION_PRESETS.get(resolution, RESOLUTION_PRESETS["720p"])
@@ -311,6 +347,10 @@ class Plugin:
     _reconnect_next_attempt_at: float = 0.0
     _reconnect_attempts: int = 0
     _reconnect_grace_seconds: int = 90
+    _rtmp_disconnect_streak: int = 0
+    _last_rtmp_disconnect_at: float = 0.0
+    _force_software_encoder: bool = False
+    _effective_fps_override: int = 0
     
 
     async def get_wakeup_count(self):
@@ -536,18 +576,37 @@ class Plugin:
             # Video pipeline using pipewiresrc (from working script)
             # Using rtmpsink instead of rtmp2sink, simpler vaapih264enc config
             
-            # Build encoder options
+            requested_fps = self._framerate
+            effective_fps = self._effective_fps_override or requested_fps
+            if effective_fps != requested_fps:
+                logger.warning(
+                    f"[stream:{self._stream_session_id}] Using recovery framerate {effective_fps}fps (requested {requested_fps}fps)"
+                )
+
+            encoder = "vaapih264enc"
             encoder_opts = f"bitrate={self._videoBitrate}"
             if self._keyframeInterval > 0:
                 encoder_opts += f" keyframe-period={self._keyframeInterval}"
             if self._bframes > 0:
                 encoder_opts += f" max-bframes={self._bframes}"
-            
-            logger.info(f"Encoder options: {encoder_opts}")
-            logger.info(f"Framerate: {self._framerate} fps")
-            
+
+            # After repeated RTMP disconnects, switch to software encoder for safer timestamps.
+            if self._force_software_encoder or not _gst_has_element("vaapih264enc"):
+                encoder = "x264enc" if _gst_has_element("x264enc") else "vaapih264enc"
+                if encoder == "x264enc":
+                    keyint = self._keyframeInterval if self._keyframeInterval > 0 else effective_fps
+                    encoder_opts = (
+                        f"bitrate={self._videoBitrate} tune=zerolatency speed-preset=veryfast "
+                        f"key-int-max={max(1, keyint)} bframes=0"
+                    )
+
+            logger.info(
+                f"[stream:{self._stream_session_id}] encoder={encoder} options={encoder_opts}"
+            )
+            logger.info(f"Framerate: {effective_fps} fps")
+
             # Build framerate caps
-            framerate_caps = f"video/x-raw,framerate={self._framerate}/1"
+            framerate_caps = f"video/x-raw,framerate={effective_fps}/1"
             
             video_source = "pipewiresrc do-timestamp=true"
             if capture_backend == "ximagesrc":
@@ -556,20 +615,30 @@ class Plugin:
             if scale_caps:
                 video_pipeline = (
                     f"{video_source} ! "
-                    f"videoconvert ! videoscale ! videorate ! {scale_caps},framerate={self._framerate}/1 ! queue ! "
-                    f"vaapih264enc {encoder_opts} ! "
-                    f"h264parse ! queue ! "
-                    f"flvmux name=mux ! "
-                    f"rtmpsink location=\"{rtmp_full_url}\""
+                    f"videoconvert ! videoscale ! videorate ! {scale_caps},framerate={effective_fps}/1 ! "
+                    f"queue max-size-buffers=120 max-size-bytes=0 max-size-time=0 ! "
+                    f"{encoder} {encoder_opts} ! "
+                    f"h264parse config-interval=1 ! "
+                    f"queue max-size-buffers=120 max-size-bytes=0 max-size-time=0 ! "
+                    f"{'h264timestamper ! ' if _gst_has_element('h264timestamper') else ''}"
+                    f"flvmux name=mux streamable=true "
+                    f"{'enforce-increasing-timestamps=true ' if _gst_element_has_property('flvmux', 'enforce-increasing-timestamps') else ''}"
+                    f"{'skip-backwards-streams=true ' if _gst_element_has_property('flvmux', 'skip-backwards-streams') else ''}"
+                    f"! rtmpsink location=\"{rtmp_full_url}\" sync=false async=false"
                 )
             else:
                 video_pipeline = (
                     f"{video_source} ! "
-                    f"videoconvert ! videorate ! {framerate_caps} ! queue ! "
-                    f"vaapih264enc {encoder_opts} ! "
-                    f"h264parse ! queue ! "
-                    f"flvmux name=mux ! "
-                    f"rtmpsink location=\"{rtmp_full_url}\""
+                    f"videoconvert ! videorate ! {framerate_caps} ! "
+                    f"queue max-size-buffers=120 max-size-bytes=0 max-size-time=0 ! "
+                    f"{encoder} {encoder_opts} ! "
+                    f"h264parse config-interval=1 ! "
+                    f"queue max-size-buffers=120 max-size-bytes=0 max-size-time=0 ! "
+                    f"{'h264timestamper ! ' if _gst_has_element('h264timestamper') else ''}"
+                    f"flvmux name=mux streamable=true "
+                    f"{'enforce-increasing-timestamps=true ' if _gst_element_has_property('flvmux', 'enforce-increasing-timestamps') else ''}"
+                    f"{'skip-backwards-streams=true ' if _gst_element_has_property('flvmux', 'skip-backwards-streams') else ''}"
+                    f"! rtmpsink location=\"{rtmp_full_url}\" sync=false async=false"
                 )
 
             cmd = f"{start_command} {video_pipeline}"
@@ -682,6 +751,10 @@ class Plugin:
             logger.info("Cancelling active reconnect loop")
             Plugin._clear_reconnect_state(self)
             self._stream_start_time = None
+            self._rtmp_disconnect_streak = 0
+            self._last_rtmp_disconnect_at = 0.0
+            self._force_software_encoder = False
+            self._effective_fps_override = 0
             return
         if await Plugin.is_streaming(self) == False:
             logger.info("Error: No streaming process to stop")
@@ -691,6 +764,10 @@ class Plugin:
         proc = self._streaming_process
         self._streaming_process = None
         self._stream_start_time = None
+        self._rtmp_disconnect_streak = 0
+        self._last_rtmp_disconnect_at = 0.0
+        self._force_software_encoder = False
+        self._effective_fps_override = 0
         proc.send_signal(signal.SIGINT)
         logger.info("SIGINT sent. Waiting...")
         
@@ -743,6 +820,22 @@ class Plugin:
                     f"[stream:{self._stream_session_id}] exit stdout tail:\n{_tail_text(std_out_file_path, line_count=20)}"
                 )
                 if not self._user_requested_stop and exit_code == -13:
+                    now = time.time()
+                    if now - self._last_rtmp_disconnect_at <= 90:
+                        self._rtmp_disconnect_streak += 1
+                    else:
+                        self._rtmp_disconnect_streak = 1
+                    self._last_rtmp_disconnect_at = now
+
+                    if self._rtmp_disconnect_streak >= 3:
+                        if not self._force_software_encoder:
+                            logger.warning(
+                                f"[stream:{self._stream_session_id}] repeated RTMP disconnects; enabling software encoder fallback"
+                            )
+                        self._force_software_encoder = True
+                        if self._framerate > 30:
+                            self._effective_fps_override = 30
+
                     if not Plugin._schedule_reconnect(self, "RTMP sink disconnected (SIGPIPE)"):
                         self._last_error_message = "Stream ended after repeated RTMP disconnects"
                 elif (
