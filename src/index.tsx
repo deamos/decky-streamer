@@ -503,9 +503,7 @@ const DeckyStreamer: VFC<{ serverAPI: ServerAPI, logic: DeckyStreamerLogic }> = 
                   });
                 }}
               >
-                {customRtmpUrl 
-                  ? (customRtmpUrl.length > 30 ? customRtmpUrl.slice(0, 30) + "..." : customRtmpUrl)
-                  : "Tap to enter RTMP URL..."}
+                {customRtmpUrl ? "••••••••••••" : "Tap to enter RTMP URL..."}
               </ButtonItem>
             </PanelSectionRow>
             <PanelSectionRow>
