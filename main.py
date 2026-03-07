@@ -4,7 +4,9 @@ import traceback
 import subprocess
 import signal
 import time
+import json
 from pathlib import Path
+from urllib.parse import urlparse
 from settings import SettingsManager
 import decky_plugin
 import logging
@@ -140,6 +142,49 @@ def build_rtmp_url(platform, custom_url, stream_key):
     return url
 
 
+def _sanitize_rtmp_url(url: str):
+    """Return a safe diagnostic view of RTMP URL (no key/token values)."""
+    if not url:
+        return {"raw": "", "scheme": "", "host": "", "path_preview": "", "path_depth": 0}
+    parsed = urlparse(url)
+    path_parts = [p for p in parsed.path.split("/") if p]
+    preview_parts = path_parts[:2]
+    preview = "/".join(preview_parts)
+    if len(path_parts) > 2:
+        preview += "/..."
+    return {
+        "raw": f"{parsed.scheme}://{parsed.netloc}",
+        "scheme": parsed.scheme,
+        "host": parsed.netloc,
+        "path_preview": preview,
+        "path_depth": len(path_parts),
+    }
+
+
+def _tail_text(path: Path, line_count: int = 40):
+    """Read a small tail chunk from a log file."""
+    try:
+        if not path.exists():
+            return ""
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            end = f.tell()
+            read_size = min(end, 32768)
+            f.seek(end - read_size)
+            data = f.read().decode("utf-8", errors="ignore")
+        lines = data.splitlines()
+        return "\n".join(lines[-line_count:])
+    except Exception:
+        return ""
+
+
+def _is_pipewire_stream_error(stderr_tail: str):
+    if not stderr_tail:
+        return False
+    s = stderr_tail.lower()
+    return "gstpipewiresrc" in s and "reason error (-5)" in s
+
+
 RTMP_MISSING_MESSAGE = (
     "RTMP plugin not available (missing librtmp). "
     "On SteamOS: open Konsole and run: sudo steamos-readonly disable && sudo pacman -S rtmpdump && sudo steamos-readonly enable"
@@ -167,6 +212,42 @@ def _check_rtmpsink_available():
         timeout=5,
     )
     return result.returncode == 0
+
+
+_GST_INSPECT_CACHE = {}
+
+
+def _gst_inspect_output(element: str):
+    """Return cached gst-inspect output for an element, or empty if unavailable."""
+    if element in _GST_INSPECT_CACHE:
+        return _GST_INSPECT_CACHE[element]
+    env = _streaming_env()
+    result = subprocess.run(
+        ["gst-inspect-1.0", element],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    out = result.stdout if result.returncode == 0 else ""
+    _GST_INSPECT_CACHE[element] = out
+    return out
+
+
+def _gst_has_element(element: str):
+    return bool(_gst_inspect_output(element))
+
+
+def _gst_element_has_property(element: str, prop: str):
+    out = _gst_inspect_output(element)
+    if not out:
+        return False
+    # gst-inspect uses "prop-name : Type" in the "Element Properties" section.
+    needle = f"{prop} "
+    for line in out.splitlines():
+        if line.strip().startswith(needle) and ":" in line:
+            return True
+    return False
 
 
 def get_video_scale_caps(resolution):
@@ -254,6 +335,22 @@ class Plugin:
     _stream_start_time = None
     _stream_error: bool = False
     _last_error_message: str = ""
+    _stream_session_id: str = ""
+    _stderr_last_mtime: float = 0.0
+    _watchdog_tick: int = 0
+    _user_requested_stop: bool = False
+    _recovery_pending: bool = False
+    _capture_backend_preference: str = "pipewire"  # pipewire | ximagesrc
+    _recovery_attempts: int = 0
+    _reconnect_active: bool = False
+    _reconnect_started_at: float = 0.0
+    _reconnect_next_attempt_at: float = 0.0
+    _reconnect_attempts: int = 0
+    _reconnect_grace_seconds: int = 90
+    _rtmp_disconnect_streak: int = 0
+    _last_rtmp_disconnect_at: float = 0.0
+    _force_software_encoder: bool = False
+    _effective_fps_override: int = 0
     
 
     async def get_wakeup_count(self):
@@ -270,12 +367,53 @@ class Plugin:
                 logger.info(f"Killing rogue process {pid}")
                 os.kill(pid, signal.SIGKILL)
 
+    def _clear_reconnect_state(self):
+        self._reconnect_active = False
+        self._reconnect_started_at = 0.0
+        self._reconnect_next_attempt_at = 0.0
+        self._reconnect_attempts = 0
+
+    def _schedule_reconnect(self, reason: str, force_delay: int = None):
+        now = time.time()
+        if not self._reconnect_active:
+            self._reconnect_active = True
+            self._reconnect_started_at = now
+            self._reconnect_attempts = 0
+
+        elapsed = now - self._reconnect_started_at
+        if elapsed >= self._reconnect_grace_seconds:
+            self._recovery_pending = False
+            Plugin._clear_reconnect_state(self)
+            self._stream_error = True
+            self._last_error_message = (
+                f"Stream could not recover after {self._reconnect_grace_seconds}s "
+                f"(last reason: {reason})"
+            )
+            logger.error(
+                f"[stream:{self._stream_session_id}] reconnect grace exceeded ({elapsed:.1f}s), giving up"
+            )
+            return False
+
+        backoff_steps = [1, 2, 4, 8, 10]
+        delay = force_delay if force_delay is not None else backoff_steps[min(self._reconnect_attempts, len(backoff_steps) - 1)]
+        self._reconnect_attempts += 1
+        self._reconnect_next_attempt_at = now + delay
+        self._recovery_pending = True
+        self._stream_error = False
+        self._last_error_message = ""
+        logger.warning(
+            f"[stream:{self._stream_session_id}] scheduling reconnect attempt={self._reconnect_attempts} in {delay}s (reason: {reason})"
+        )
+        return True
+
     async def watchdog(self):
         logger.info("Watchdog started")
         while True:
             try:
+                self._watchdog_tick += 1
                 in_gm = in_gamemode()
-                is_streaming = await Plugin.is_streaming(self, verbose=False)
+                # For watchdog decisions, only treat an active gst process as "streaming".
+                is_streaming = await Plugin.is_streaming(self, verbose=False, include_reconnect=False)
                 
                 # Stop streaming if we leave game mode
                 if not in_gm and is_streaming:
@@ -283,40 +421,47 @@ class Plugin:
                     await Plugin.stop_streaming(self)
                     await Plugin.clear_rogue_gst_processes(self)
                 
+                if self._recovery_pending and not is_streaming:
+                    now = time.time()
+                    if now < self._reconnect_next_attempt_at:
+                        await asyncio.sleep(1)
+                        continue
+                    logger.warning(
+                        f"[stream:{self._stream_session_id}] recovery pending, restarting with backend={self._capture_backend_preference}"
+                    )
+                    self._recovery_pending = False
+                    recovered = await Plugin.start_streaming(self)
+                    if not recovered and self._reconnect_active:
+                        Plugin._schedule_reconnect(self, "Reconnect attempt failed")
+                    continue
+                
                 # Check for process crash/exit (is_streaming already handles this, 
                 # but we also want to check stderr for connection errors)
                 if self._streaming_process is not None:
-                    # Check stderr for connection errors without blocking
+                    # Periodically capture process health and stderr tail for postmortem diagnostics.
+                    if self._watchdog_tick % 5 == 0:
+                        try:
+                            proc = psutil.Process(self._streaming_process.pid)
+                            cpu_pct = proc.cpu_percent(interval=None)
+                            rss_mb = round(proc.memory_info().rss / (1024 * 1024), 1)
+                            logger.info(
+                                f"[stream:{self._stream_session_id}] health pid={proc.pid} cpu={cpu_pct:.1f}% rss={rss_mb}MB"
+                            )
+                        except Exception as proc_err:
+                            logger.debug(f"[stream:{self._stream_session_id}] health sample failed: {proc_err}")
+
                     try:
-                        import select
-                        if hasattr(self._streaming_process, 'stderr') and self._streaming_process.stderr:
-                            # Non-blocking read check
-                            ready, _, _ = select.select([self._streaming_process.stderr], [], [], 0)
-                            if ready:
-                                line = self._streaming_process.stderr.readline()
-                                if line:
-                                    line_str = line.decode('utf-8', errors='ignore').strip()
-                                    # Check for connection-related errors
-                                    error_indicators = [
-                                        "Connection refused",
-                                        "Could not connect",
-                                        "Failed to connect",
-                                        "Connection timed out",
-                                        "Connection reset",
-                                        "Broken pipe",
-                                        "Network is unreachable",
-                                        "RTMP connection failed",
-                                        "rtmp2sink",
-                                        "ERROR",
-                                    ]
-                                    for indicator in error_indicators:
-                                        if indicator.lower() in line_str.lower():
-                                            logger.error(f"Stream connection error: {line_str}")
-                                            self._stream_error = True
-                                            self._last_error_message = line_str[:200]  # Truncate long messages
-                                            break
+                        if std_err_file_path.exists():
+                            mtime = std_err_file_path.stat().st_mtime
+                            if mtime > self._stderr_last_mtime:
+                                self._stderr_last_mtime = mtime
+                                tail = _tail_text(std_err_file_path, line_count=12)
+                                if tail:
+                                    logger.info(
+                                        f"[stream:{self._stream_session_id}] stderr tail update:\n{tail}"
+                                    )
                     except Exception as e:
-                        logger.debug(f"Error checking stderr: {e}")
+                        logger.debug(f"[stream:{self._stream_session_id}] Error checking stderr tail: {e}")
                     
             except Exception as e:
                 logger.exception(f"Watchdog exception! {str(e)}")
@@ -326,7 +471,7 @@ class Plugin:
             prev_wakeup_count = await Plugin.get_wakeup_count(self)
             
             if wakeup_count > prev_wakeup_count + 1:
-                if await Plugin.is_streaming(self, verbose=False):
+                if await Plugin.is_streaming(self, verbose=False, include_reconnect=False):
                     await asyncio.sleep(1)
                     logger.warn("Wakeup from sleep detected, restarting stream")
                     await Plugin.stop_streaming(self)
@@ -339,12 +484,14 @@ class Plugin:
         """Start the RTMP streaming process"""
         try:
             logger.info("Starting stream")
+            self._user_requested_stop = False
+            self._recovery_pending = False
             
             # Clear any previous error state
             self._stream_error = False
             self._last_error_message = ""
 
-            if await Plugin.is_streaming(self):
+            if await Plugin.is_streaming(self, include_reconnect=False):
                 logger.info("Error: Already streaming")
                 return False
 
@@ -384,7 +531,25 @@ class Plugin:
 
             # Build the full RTMP URL
             rtmp_full_url = build_rtmp_url(self._platform, self._customRtmpUrl, self._streamKey)
-            logger.info(f"Streaming to platform: {self._platform} (key hidden)")
+            self._stream_session_id = str(int(time.time()))
+            safe_url = _sanitize_rtmp_url(rtmp_full_url)
+            safe_custom = _sanitize_rtmp_url(self._customRtmpUrl)
+            stream_config = {
+                "platform": self._platform,
+                "resolution": self._resolution,
+                "fps": self._framerate,
+                "video_kbps": self._videoBitrate,
+                "audio_kbps": self._audioBitrate,
+                "keyframe_interval": self._keyframeInterval,
+                "bframes": self._bframes,
+                "mic_enabled": self._micEnabled,
+                "stream_key_len": len(self._streamKey or ""),
+                "custom_url": safe_custom,
+                "effective_url": safe_url,
+            }
+            logger.info(
+                f"[stream:{self._stream_session_id}] start config: {json.dumps(stream_config, sort_keys=True)}"
+            )
 
             # Fail fast if rtmpsink (librtmp) is not available
             if not _check_rtmpsink_available():
@@ -399,8 +564,8 @@ class Plugin:
             # Video bitrate in bits/second for GStreamer
             video_bitrate_bps = self._videoBitrate * 1000
 
-            # Use PipeWire for video capture (matches working script)
-            logger.info("Using pipewiresrc for video capture")
+            capture_backend = self._capture_backend_preference
+            logger.info(f"Using {capture_backend} for video capture")
             
             start_command = (
                 "GST_VAAPI_ALL_DRIVERS=1 GST_PLUGIN_PATH={} gst-launch-1.0 -e -vvv".format(
@@ -411,36 +576,69 @@ class Plugin:
             # Video pipeline using pipewiresrc (from working script)
             # Using rtmpsink instead of rtmp2sink, simpler vaapih264enc config
             
-            # Build encoder options
+            requested_fps = self._framerate
+            effective_fps = self._effective_fps_override or requested_fps
+            if effective_fps != requested_fps:
+                logger.warning(
+                    f"[stream:{self._stream_session_id}] Using recovery framerate {effective_fps}fps (requested {requested_fps}fps)"
+                )
+
+            encoder = "vaapih264enc"
             encoder_opts = f"bitrate={self._videoBitrate}"
             if self._keyframeInterval > 0:
                 encoder_opts += f" keyframe-period={self._keyframeInterval}"
             if self._bframes > 0:
                 encoder_opts += f" max-bframes={self._bframes}"
-            
-            logger.info(f"Encoder options: {encoder_opts}")
-            logger.info(f"Framerate: {self._framerate} fps")
-            
+
+            # After repeated RTMP disconnects, switch to software encoder for safer timestamps.
+            if self._force_software_encoder or not _gst_has_element("vaapih264enc"):
+                encoder = "x264enc" if _gst_has_element("x264enc") else "vaapih264enc"
+                if encoder == "x264enc":
+                    keyint = self._keyframeInterval if self._keyframeInterval > 0 else effective_fps
+                    encoder_opts = (
+                        f"bitrate={self._videoBitrate} tune=zerolatency speed-preset=veryfast "
+                        f"key-int-max={max(1, keyint)} bframes=0"
+                    )
+
+            logger.info(
+                f"[stream:{self._stream_session_id}] encoder={encoder} options={encoder_opts}"
+            )
+            logger.info(f"Framerate: {effective_fps} fps")
+
             # Build framerate caps
-            framerate_caps = f"video/x-raw,framerate={self._framerate}/1"
+            framerate_caps = f"video/x-raw,framerate={effective_fps}/1"
             
+            video_source = "pipewiresrc do-timestamp=true"
+            if capture_backend == "ximagesrc":
+                video_source = "ximagesrc use-damage=0 show-pointer=false do-timestamp=true"
+
             if scale_caps:
                 video_pipeline = (
-                    f"pipewiresrc do-timestamp=true ! "
-                    f"videoconvert ! videoscale ! videorate ! {scale_caps},framerate={self._framerate}/1 ! queue ! "
-                    f"vaapih264enc {encoder_opts} ! "
-                    f"h264parse ! queue ! "
-                    f"flvmux name=mux ! "
-                    f"rtmpsink location=\"{rtmp_full_url}\""
+                    f"{video_source} ! "
+                    f"videoconvert ! videoscale ! videorate ! {scale_caps},framerate={effective_fps}/1 ! "
+                    f"queue max-size-buffers=120 max-size-bytes=0 max-size-time=0 ! "
+                    f"{encoder} {encoder_opts} ! "
+                    f"h264parse config-interval=1 ! "
+                    f"queue max-size-buffers=120 max-size-bytes=0 max-size-time=0 ! "
+                    f"{'h264timestamper ! ' if _gst_has_element('h264timestamper') else ''}"
+                    f"flvmux name=mux streamable=true "
+                    f"{'enforce-increasing-timestamps=true ' if _gst_element_has_property('flvmux', 'enforce-increasing-timestamps') else ''}"
+                    f"{'skip-backwards-streams=true ' if _gst_element_has_property('flvmux', 'skip-backwards-streams') else ''}"
+                    f"! rtmpsink location=\"{rtmp_full_url}\" sync=false async=false"
                 )
             else:
                 video_pipeline = (
-                    f"pipewiresrc do-timestamp=true ! "
-                    f"videoconvert ! videorate ! {framerate_caps} ! queue ! "
-                    f"vaapih264enc {encoder_opts} ! "
-                    f"h264parse ! queue ! "
-                    f"flvmux name=mux ! "
-                    f"rtmpsink location=\"{rtmp_full_url}\""
+                    f"{video_source} ! "
+                    f"videoconvert ! videorate ! {framerate_caps} ! "
+                    f"queue max-size-buffers=120 max-size-bytes=0 max-size-time=0 ! "
+                    f"{encoder} {encoder_opts} ! "
+                    f"h264parse config-interval=1 ! "
+                    f"queue max-size-buffers=120 max-size-bytes=0 max-size-time=0 ! "
+                    f"{'h264timestamper ! ' if _gst_has_element('h264timestamper') else ''}"
+                    f"flvmux name=mux streamable=true "
+                    f"{'enforce-increasing-timestamps=true ' if _gst_element_has_property('flvmux', 'enforce-increasing-timestamps') else ''}"
+                    f"{'skip-backwards-streams=true ' if _gst_element_has_property('flvmux', 'skip-backwards-streams') else ''}"
+                    f"! rtmpsink location=\"{rtmp_full_url}\" sync=false async=false"
                 )
 
             cmd = f"{start_command} {video_pipeline}"
@@ -472,11 +670,18 @@ class Plugin:
 
             # Start the streaming process (use plugin bin for LD_LIBRARY_PATH so bundled librtmp is found)
             # start_new_session=True so we can kill the whole process group on timeout (shell + gst-launch)
-            logger.info("Command: " + cmd)
+            redacted_cmd = cmd.replace(rtmp_full_url, f"{safe_url['raw']}/<redacted-key>")
+            logger.info(f"[stream:{self._stream_session_id}] Command: {redacted_cmd}")
             env = _streaming_env()
+            logger.info(
+                f"[stream:{self._stream_session_id}] env summary: LD_LIBRARY_PATH={env.get('LD_LIBRARY_PATH','')} GST_PLUGIN_PATH={env.get('GST_PLUGIN_PATH','')}"
+            )
             self._streaming_process = subprocess.Popen(
                 cmd, shell=True, stdout=std_out_file, stderr=std_err_file, env=env,
                 start_new_session=True,
+            )
+            logger.info(
+                f"[stream:{self._stream_session_id}] gst subprocess spawned pid={self._streaming_process.pid}"
             )
             
             # Wait a moment and check if process is still running
@@ -497,6 +702,9 @@ class Plugin:
                 except Exception as read_err:
                     self._last_error_message = "Stream ended unexpectedly (see decky-streamer-std-err.log)"
                     logger.error(f"Could not read stderr: {read_err}")
+                logger.error(
+                    f"[stream:{self._stream_session_id}] startup failure stderr tail:\n{_tail_text(std_err_file_path)}"
+                )
                 await Plugin.cleanup_decky_pa_sink(self)
                 return False
             if proc.poll() is not None:
@@ -515,11 +723,16 @@ class Plugin:
                 except Exception as read_err:
                     self._last_error_message = f"Stream ended unexpectedly (exit code: {exit_code})"
                     logger.error(f"Could not read stderr: {read_err}")
+                logger.error(
+                    f"[stream:{self._stream_session_id}] immediate exit stderr tail:\n{_tail_text(std_err_file_path)}"
+                )
                 self._streaming_process = None
                 await Plugin.cleanup_decky_pa_sink(self)
                 return False
             
             self._stream_start_time = time.time()
+            self._recovery_attempts = 0
+            Plugin._clear_reconnect_state(self)
             logger.info("Streaming started!")
             return True
             
@@ -532,6 +745,17 @@ class Plugin:
     async def stop_streaming(self):
         """Stop the streaming process"""
         logger.info("Stopping stream")
+        self._user_requested_stop = True
+        self._recovery_pending = False
+        if self._streaming_process is None and self._reconnect_active:
+            logger.info("Cancelling active reconnect loop")
+            Plugin._clear_reconnect_state(self)
+            self._stream_start_time = None
+            self._rtmp_disconnect_streak = 0
+            self._last_rtmp_disconnect_at = 0.0
+            self._force_software_encoder = False
+            self._effective_fps_override = 0
+            return
         if await Plugin.is_streaming(self) == False:
             logger.info("Error: No streaming process to stop")
             return
@@ -540,6 +764,10 @@ class Plugin:
         proc = self._streaming_process
         self._streaming_process = None
         self._stream_start_time = None
+        self._rtmp_disconnect_streak = 0
+        self._last_rtmp_disconnect_at = 0.0
+        self._force_software_encoder = False
+        self._effective_fps_override = 0
         proc.send_signal(signal.SIGINT)
         logger.info("SIGINT sent. Waiting...")
         
@@ -567,9 +795,12 @@ class Plugin:
         await Plugin.cleanup_decky_pa_sink(self)
         return
 
-    async def is_streaming(self, verbose=False):
+    async def is_streaming(self, verbose=False, include_reconnect=True):
         """Check if currently streaming"""
         if self._streaming_process is None:
+            # Keep UI in LIVE state while reconnect loop is active.
+            if include_reconnect and self._reconnect_active:
+                return True
             return False
         
         # Check if process is actually still running
@@ -578,9 +809,47 @@ class Plugin:
             # Process has exited
             exit_code = poll_result
             if exit_code != 0:
-                logger.warning(f"Streaming process exited with code {exit_code}")
-                self._stream_error = True
-                self._last_error_message = f"Stream ended unexpectedly (exit code: {exit_code})"
+                logger.warning(
+                    f"[stream:{self._stream_session_id}] Streaming process exited with code {exit_code}"
+                )
+                stderr_tail = _tail_text(std_err_file_path)
+                logger.error(
+                    f"[stream:{self._stream_session_id}] exit stderr tail:\n{stderr_tail}"
+                )
+                logger.info(
+                    f"[stream:{self._stream_session_id}] exit stdout tail:\n{_tail_text(std_out_file_path, line_count=20)}"
+                )
+                if not self._user_requested_stop and exit_code == -13:
+                    now = time.time()
+                    if now - self._last_rtmp_disconnect_at <= 90:
+                        self._rtmp_disconnect_streak += 1
+                    else:
+                        self._rtmp_disconnect_streak = 1
+                    self._last_rtmp_disconnect_at = now
+
+                    if self._rtmp_disconnect_streak >= 3:
+                        if not self._force_software_encoder:
+                            logger.warning(
+                                f"[stream:{self._stream_session_id}] repeated RTMP disconnects; enabling software encoder fallback"
+                            )
+                        self._force_software_encoder = True
+                        if self._framerate > 30:
+                            self._effective_fps_override = 30
+
+                    if not Plugin._schedule_reconnect(self, "RTMP sink disconnected (SIGPIPE)"):
+                        self._last_error_message = "Stream ended after repeated RTMP disconnects"
+                elif (
+                    not self._user_requested_stop
+                    and _is_pipewire_stream_error(stderr_tail)
+                    and self._recovery_attempts < 2
+                ):
+                    self._capture_backend_preference = "ximagesrc"
+                    self._recovery_attempts += 1
+                    if not Plugin._schedule_reconnect(self, "PipeWire capture failure", force_delay=1):
+                        self._last_error_message = "Stream ended after repeated capture failures"
+                else:
+                    self._stream_error = True
+                    self._last_error_message = f"Stream ended unexpectedly (exit code: {exit_code})"
             
             # Clean up
             self._streaming_process = None
