@@ -161,7 +161,7 @@ After installing, restart the microphone toggle to see noise reduction options.
 
 ## License
 
-BSD-3-Clause (same as decky-recorder-fork)
+GPL 3.0
 
 ## Acknowledgments
 

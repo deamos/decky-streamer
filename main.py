@@ -328,7 +328,9 @@ class Plugin:
     _deckySinkModuleName: str = "Decky-Streaming-Sink"
     _echoCancelledAudioName: str = "Echo-Cancelled-Audio"
     _echoCancelledMicName: str = "Echo-Cancelled-Mic"
-    _optional_denoise_binary_path = decky_plugin.DECKY_USER_HOME + "/homebrew/data/decky-streamer/librnnoise_ladspa.so"
+    _optional_denoise_binary_path = None  # resolved at runtime in _resolve_denoise_path
+    _legacy_denoise_binary_path = decky_plugin.DECKY_USER_HOME + "/homebrew/data/decky-streamer/librnnoise_ladspa.so"
+    _bundled_denoise_binary_path = str(DEPSPATH / "librnnoise_ladspa.so")
     _watchdog_task = None
     _wakeup_count = 1
     _settings = None
@@ -959,7 +961,14 @@ class Plugin:
         await Plugin.saveConfig(self)
 
     async def enhanced_noise_binary_exists(self):
-        return os.path.exists(self._optional_denoise_binary_path)
+        # Check bundled path first, then legacy user-data path
+        if os.path.exists(self._bundled_denoise_binary_path):
+            self._optional_denoise_binary_path = self._bundled_denoise_binary_path
+            return True
+        if os.path.exists(self._legacy_denoise_binary_path):
+            self._optional_denoise_binary_path = self._legacy_denoise_binary_path
+            return True
+        return False
 
     async def get_noise_reduction_percent(self):
         return self._noiseReductionPercent
