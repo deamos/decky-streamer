@@ -12,6 +12,7 @@ RUN mkdir /pacman && pacman -Sydd --noconfirm --root /pacman --dbpath /var/lib/p
     rtmpdump
 
 # Remove unnecessary plugins to reduce size
+# NOTE: libgstladspa.so is kept — it is required for loading LADSPA plugins (rnnoise)
 RUN cd /pacman/usr/lib/gstreamer-1.0/ && rm -f \
     libgstneonhttpsrc.so \
     libgstfaad.so \
@@ -45,8 +46,15 @@ RUN cd /pacman/usr/lib/gstreamer-1.0/ && rm -f \
     libgstwavpack.so \
     libgstde265.so \
     libgstsrtp.so \
-    libgstladspa.so \
     libgstdv.so || true
+
+# Download rnnoise noise suppression LADSPA plugin (GPL-3.0)
+# https://github.com/werman/noise-suppression-for-voice
+RUN pacman -Sydd --noconfirm --dbpath /var/lib/pacman unzip && \
+    mkdir -p /rnnoise && \
+    curl -L "https://github.com/werman/noise-suppression-for-voice/releases/download/v1.03/linux-rnnoise.zip" -o /tmp/linux-rnnoise.zip && \
+    unzip -j /tmp/linux-rnnoise.zip 'linux-rnnoise/ladspa/librnnoise_ladspa.so' -d /rnnoise && \
+    rm /tmp/linux-rnnoise.zip
 
 RUN pacman -Sydd --noconfirm --dbpath /var/lib/pacman python-pip
 

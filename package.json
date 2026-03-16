@@ -1,6 +1,6 @@
 {
   "name": "decky-streamer",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Stream your Steam Deck gameplay to RTMP endpoints like Twitch, YouTube, etc.",
   "scripts": {
     "build": "shx rm -rf dist && rollup -c",
@@ -22,7 +22,7 @@
     "youtube"
   ],
   "author": "Deamos",
-  "license": "BSD-3-Clause",
+  "license": "GPL-3.0-only",
   "devDependencies": {
     "@rollup/plugin-commonjs": "^21.1.0",
     "@rollup/plugin-json": "^4.1.0",
