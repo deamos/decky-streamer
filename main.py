@@ -664,9 +664,13 @@ class Plugin:
             audio_bitrate_bps = self._audioBitrate * 1000
             cmd = (
                 cmd
-                + f' pulsesrc device="{self._deckySinkModuleName}.monitor" ! '
-                + f'audio/x-raw,channels=2 ! audioconvert ! '
+                + f' pulsesrc device="{self._deckySinkModuleName}.monitor" do-timestamp=true ! '
+                + f'queue max-size-buffers=120 max-size-bytes=0 max-size-time=0 ! '
+                + f'audio/x-raw,rate=48000,channels=2 ! '
+                + f'audioconvert ! audioresample ! audiorate ! '
                 + f'avenc_aac bitrate={audio_bitrate_bps} ! '
+                + f'aacparse ! '
+                + f'queue max-size-buffers=120 max-size-bytes=0 max-size-time=0 ! '
                 + f'mux.'
             )
 
@@ -887,8 +891,8 @@ class Plugin:
         logger.debug("Creating audio pipeline")
         audio_device_output = get_cmd_output("pactl get-default-sink", log=False)
 
-        get_cmd_output(f"pactl load-module module-null-sink sink_name={self._deckySinkModuleName}")
-        get_cmd_output(f"pactl load-module module-loopback source={audio_device_output}.monitor sink={self._deckySinkModuleName}")
+        get_cmd_output(f"pactl load-module module-null-sink sink_name={self._deckySinkModuleName} rate=48000")
+        get_cmd_output(f"pactl load-module module-loopback source={audio_device_output}.monitor sink={self._deckySinkModuleName} latency_msec=30 adjust_time=0")
 
         if await Plugin.is_mic_enabled(self):
             await Plugin.attach_mic(self)
