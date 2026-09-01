@@ -100,12 +100,21 @@ def get_cmd_output(cmd, log=True):
     env = os.environ.copy()
     env.pop('LD_LIBRARY_PATH', None)
     env.pop('LD_PRELOAD', None)
+    env["XDG_RUNTIME_DIR"] = "/run/user/1000"
+    env["PULSE_SERVER"] = "unix:/run/user/1000/pulse/native"
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=env)
-    return (result.stdout + result.stderr).strip()
+    if result.returncode != 0:
+        if log:
+            logger.debug(f"Command failed ({result.returncode}): {result.stderr.strip()}")
+        return ""
+    return result.stdout.strip()
 
 
 def unload_pa_modules(search_string):
-    module_list = get_cmd_output(f"pactl list short modules | grep '{search_string}' | awk '{{print $1}}'").split("\n")
+    output = get_cmd_output(f"pactl list short modules | grep '{search_string}' | awk '{{print $1}}'", log=False)
+    if not output:
+        return
+    module_list = [m.strip() for m in output.split("\n") if m.strip()]
     for module_id in module_list:
         get_cmd_output(f"pactl unload-module {module_id}")
 
@@ -646,13 +655,9 @@ class Plugin:
             cmd = f"{start_command} {video_pipeline}"
 
             # Setup audio sink
-            env = os.environ.copy()
-            env.pop('LD_LIBRARY_PATH', None)
-            env.pop('LD_PRELOAD', None)
-            deckyStreamingSinkExists = subprocess.run(
-                f"pactl list sinks | grep '{self._deckySinkModuleName}'", 
-                shell=True, env=env
-            ).returncode == 0
+            deckyStreamingSinkExists = bool(
+                get_cmd_output(f"pactl list sinks | grep '{self._deckySinkModuleName}'", log=False)
+            )
 
             if deckyStreamingSinkExists:
                 logger.info(f"{self._deckySinkModuleName} already exists, rebuilding sink for safety")
@@ -903,16 +908,16 @@ class Plugin:
 
     # Microphone management
     async def get_default_mic(self):
-        return get_cmd_output("pactl get-default-source")
+        output = get_cmd_output("pactl get-default-source", log=False)
+        return output if output else "auto"
 
     async def is_mic_enabled(self):
         return self._micEnabled
 
     async def is_mic_attached(self):
-        env = os.environ.copy()
-        env.pop('LD_LIBRARY_PATH', None)
-        env.pop('LD_PRELOAD', None)
-        is_attached = subprocess.run("pactl list modules | grep 'Echo-Cancelled'", shell=True, env=env).returncode == 0
+        is_attached = bool(
+            get_cmd_output("pactl list modules | grep 'Echo-Cancelled'", log=False)
+        )
         return is_attached
 
     async def attach_mic(self):
@@ -989,9 +994,10 @@ class Plugin:
 
     async def get_mic_sources(self):
         import json
-        raw_sources = get_cmd_output("pactl list short sources | awk '{print $2}'", log=False).split("\n")
+        raw_output = get_cmd_output("pactl list short sources | awk '{print $2}'", log=False)
+        raw_sources = [s.strip() for s in raw_output.split("\n") if s.strip()] if raw_output else []
         default_source = await Plugin.get_default_mic(self)
-        sources_json = [{"data": f"{default_source}", "label": "Default Mic"}]
+        sources_json = [{"data": default_source, "label": "Default Mic"}]
         for source in raw_sources:
             if "Echo" not in source and "monitor" not in source and "Decky" not in source and source != default_source:
                 sources_json.append({"data": source, "label": source})
@@ -1128,6 +1134,9 @@ class Plugin:
         return
 
     async def _main(self):
+        os.environ["XDG_RUNTIME_DIR"] = "/run/user/1000"
+        os.environ["PULSE_SERVER"] = "unix:/run/user/1000/pulse/native"
+        os.environ["HOME"] = decky_plugin.DECKY_USER_HOME
         loop = asyncio.get_event_loop()
         self._watchdog_task = loop.create_task(Plugin.watchdog(self))
         await Plugin.loadConfig(self)
