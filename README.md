@@ -163,6 +163,10 @@ After installing, restart the microphone toggle to see noise reduction options.
 
 GPL 3.0
 
+## AI Disclosure
+
+Portions of this project and recent audio pipeline improvements were developed with the assistance of AI coding assistants.
+
 ## Acknowledgments
 
 - [decky-recorder-fork](https://github.com/SDH-Stewardship/decky-recorder-fork) by marissa999/safijari
