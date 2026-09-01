@@ -892,7 +892,7 @@ class Plugin:
         audio_device_output = get_cmd_output("pactl get-default-sink", log=False)
 
         get_cmd_output(f"pactl load-module module-null-sink sink_name={self._deckySinkModuleName} rate=48000")
-        get_cmd_output(f"pactl load-module module-loopback source={audio_device_output}.monitor sink={self._deckySinkModuleName} latency_msec=30 adjust_time=0")
+        get_cmd_output(f"pactl load-module module-loopback source={audio_device_output}.monitor sink={self._deckySinkModuleName} latency_msec=30 adjust_time=0 source_dont_move=true sink_dont_move=true")
 
         if await Plugin.is_mic_enabled(self):
             await Plugin.attach_mic(self)
@@ -926,13 +926,12 @@ class Plugin:
             get_cmd_output(f"pactl load-module module-ladspa-sink sink_name={self._echoCancelledMicName}_raw_in sink_master={self._echoCancelledMicName} label=noise_suppressor_mono plugin={self._optional_denoise_binary_path} control={self._noiseReductionPercent},20,0,0,0")
             get_cmd_output(f"pactl load-module module-loopback source={self._micSource} sink={self._echoCancelledMicName}_raw_in channels=1 source_dont_move=true sink_dont_move=true")
             get_cmd_output(f"pactl set-source-volume {self._echoCancelledMicName}.monitor {self._micGain}db")
-            get_cmd_output(f"pactl load-module module-loopback source={self._echoCancelledMicName}.monitor sink={self._deckySinkModuleName}")
+            get_cmd_output(f"pactl load-module module-loopback source={self._echoCancelledMicName}.monitor sink={self._deckySinkModuleName} source_dont_move=true sink_dont_move=true")
         else:
-            audio_device_output = get_cmd_output("pactl get-default-sink")
-            get_cmd_output(f"pactl load-module module-echo-cancel use_master_format=1 source_master={self._micSource} sink_master={audio_device_output} source_name={self._echoCancelledMicName} sink_name={self._echoCancelledAudioName} aec_method='webrtc' aec_args='analog_gain_control=0 digital_gain_control=1'")
-            get_cmd_output(f"pactl set-source-volume Echo-Cancelled-Mic {self._micGain}db")
-            get_cmd_output(f"pactl load-module module-loopback source={self._echoCancelledMicName} sink={self._deckySinkModuleName}")
-            get_cmd_output(f"pactl load-module module-loopback source={self._echoCancelledAudioName}.monitor sink={self._deckySinkModuleName}")
+            get_cmd_output(f"pactl load-module module-null-sink sink_name={self._echoCancelledMicName} rate=48000")
+            get_cmd_output(f"pactl load-module module-loopback source={self._micSource} sink={self._echoCancelledMicName} channels=1 source_dont_move=true sink_dont_move=true")
+            get_cmd_output(f"pactl set-source-volume {self._echoCancelledMicName}.monitor {self._micGain}db")
+            get_cmd_output(f"pactl load-module module-loopback source={self._echoCancelledMicName}.monitor sink={self._deckySinkModuleName} source_dont_move=true sink_dont_move=true")
 
     async def detach_mic(self):
         logger.debug(f"Detaching Microphone {self._echoCancelledMicName}")
@@ -961,7 +960,7 @@ class Plugin:
         self._micGain = float(new_gain)
         if await Plugin.is_streaming(self):
             if await Plugin.is_mic_attached(self):
-                get_cmd_output(f"pactl set-source-volume Echo-Cancelled-Mic {self._micGain}db")
+                get_cmd_output(f"pactl set-source-volume {self._echoCancelledMicName}.monitor {self._micGain}db")
         await Plugin.saveConfig(self)
 
     async def enhanced_noise_binary_exists(self):
