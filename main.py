@@ -671,8 +671,8 @@ class Plugin:
                 cmd
                 + f' pulsesrc device="{self._deckySinkModuleName}.monitor" do-timestamp=true ! '
                 + f'queue max-size-buffers=120 max-size-bytes=0 max-size-time=0 ! '
-                + f'audio/x-raw,rate=48000,channels=2 ! '
                 + f'audioconvert ! audioresample ! audiorate ! '
+                + f'audio/x-raw,rate=48000,channels=2 ! '
                 + f'avenc_aac bitrate={audio_bitrate_bps} ! '
                 + f'aacparse ! '
                 + f'queue max-size-buffers=120 max-size-bytes=0 max-size-time=0 ! '
