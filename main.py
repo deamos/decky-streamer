@@ -93,17 +93,66 @@ def in_gamemode():
     return False
 
 
+def get_pulse_env():
+    env = os.environ.copy()
+    env.pop("LD_LIBRARY_PATH", None)
+    env.pop("LD_PRELOAD", None)
+
+    runtime_dir = None
+    decky_user = getattr(decky_plugin, "DECKY_USER", None) or os.environ.get("USER")
+    if decky_user:
+        try:
+            import pwd
+            uid = pwd.getpwnam(decky_user).pw_uid
+            cand = f"/run/user/{uid}"
+            if os.path.exists(cand):
+                runtime_dir = cand
+        except Exception:
+            pass
+
+    if not runtime_dir:
+        cand = os.environ.get("XDG_RUNTIME_DIR")
+        if cand and os.path.exists(cand):
+            runtime_dir = cand
+
+    if not runtime_dir and os.path.exists("/run/user"):
+        try:
+            uids = [d for d in os.listdir("/run/user") if d.isdigit()]
+            if "1000" in uids and os.path.exists("/run/user/1000"):
+                runtime_dir = "/run/user/1000"
+            elif uids:
+                uids.sort(key=int)
+                runtime_dir = f"/run/user/{uids[0]}"
+        except Exception:
+            pass
+
+    if not runtime_dir:
+        runtime_dir = "/run/user/1000"
+
+    env["XDG_RUNTIME_DIR"] = runtime_dir
+
+    pulse_socket = os.path.join(runtime_dir, "pulse", "native")
+    if os.path.exists(pulse_socket):
+        env["PULSE_SERVER"] = f"unix:{pulse_socket}"
+    else:
+        env["PULSE_SERVER"] = f"unix:{runtime_dir}/pulse/native"
+
+    return env
+
+
 def get_cmd_output(cmd, log=True):
     if log:
         logger.debug(f"Command: {cmd}")
-    # Clear LD_LIBRARY_PATH to avoid conflicts with system libraries
-    env = os.environ.copy()
-    env.pop('LD_LIBRARY_PATH', None)
-    env.pop('LD_PRELOAD', None)
-    env["XDG_RUNTIME_DIR"] = "/run/user/1000"
-    env["PULSE_SERVER"] = "unix:/run/user/1000/pulse/native"
+    env = get_pulse_env()
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=env)
     if result.returncode != 0:
+        # If pulse failed with explicit PULSE_SERVER, try fallback without PULSE_SERVER override
+        if "PULSE_SERVER" in env and ("pulse" in cmd or "pactl" in cmd):
+            fallback_env = env.copy()
+            fallback_env.pop("PULSE_SERVER", None)
+            res2 = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=fallback_env)
+            if res2.returncode == 0:
+                return res2.stdout.strip()
         if log:
             logger.debug(f"Command failed ({result.returncode}): {result.stderr.strip()}")
         return ""
@@ -333,7 +382,7 @@ class Plugin:
     _micEnabled: bool = False
     _micGain: float = 13.0
     _noiseReductionPercent: int = 50
-    _micSource: str = "NA"
+    _micSource: str = "default"
     _deckySinkModuleName: str = "Decky-Streaming-Sink"
     _echoCancelledAudioName: str = "Echo-Cancelled-Audio"
     _echoCancelledMicName: str = "Echo-Cancelled-Mic"
@@ -446,6 +495,12 @@ class Plugin:
                         Plugin._schedule_reconnect(self, "Reconnect attempt failed")
                     continue
                 
+                # Re-attach microphone if it was lost during streaming
+                if is_streaming and self._micEnabled and (self._watchdog_tick % 5 == 0):
+                    if not await Plugin.is_mic_attached(self):
+                        logger.warning(f"[stream:{self._stream_session_id}] mic enabled but Echo-Cancelled module lost. Attempting re-attachment...")
+                        await Plugin.attach_mic(self)
+
                 # Check for process crash/exit (is_streaming already handles this, 
                 # but we also want to check stderr for connection errors)
                 if self._streaming_process is not None:
@@ -911,6 +966,82 @@ class Plugin:
         output = get_cmd_output("pactl get-default-source", log=False)
         return output if output else "auto"
 
+    async def get_raw_source_names(self):
+        raw_output = get_cmd_output("pactl list short sources | awk '{print $2}'", log=False)
+        return [s.strip() for s in raw_output.split("\n") if s.strip()] if raw_output else []
+
+    async def detect_microphones(self):
+        sources = []
+        raw_output = get_cmd_output("pactl list sources", log=False)
+        if raw_output:
+            current = None
+            for line in raw_output.splitlines():
+                stripped = line.strip()
+                if line.startswith("Source #") or line.startswith("Source:"):
+                    if current and current.get("name"):
+                        sources.append(current)
+                    current = {"name": "", "description": "", "is_monitor": False}
+                elif current is not None:
+                    if stripped.startswith("Name:"):
+                        current["name"] = stripped.split("Name:", 1)[1].strip()
+                    elif stripped.startswith("Description:"):
+                        current["description"] = stripped.split("Description:", 1)[1].strip()
+                    elif stripped.startswith("Monitor of Sink:"):
+                        val = stripped.split("Monitor of Sink:", 1)[1].strip()
+                        if val and val.lower() != "n/a":
+                            current["is_monitor"] = True
+                    elif "node.description = " in stripped and not current.get("description"):
+                        current["description"] = stripped.split("node.description = ", 1)[1].strip().strip('"')
+                    elif "device.description = " in stripped and not current.get("description"):
+                        current["description"] = stripped.split("device.description = ", 1)[1].strip().strip('"')
+            if current and current.get("name"):
+                sources.append(current)
+
+        valid_sources = []
+        seen_names = set()
+        for s in sources:
+            name = s.get("name", "")
+            if not name or name in seen_names:
+                continue
+            if s.get("is_monitor") or name.endswith(".monitor") or ".monitor." in name:
+                continue
+            if "Echo-Cancelled" in name or "Decky" in name:
+                continue
+            seen_names.add(name)
+            desc = s.get("description") or name
+            valid_sources.append({"name": name, "description": desc})
+
+        if not valid_sources:
+            raw_short = await Plugin.get_raw_source_names(self)
+            for name in raw_short:
+                if name.endswith(".monitor") or "Echo" in name or "Decky" in name or "monitor" in name:
+                    continue
+                clean_name = name
+                if clean_name.startswith("alsa_input."):
+                    clean_name = clean_name.replace("alsa_input.", "")
+                clean_name = clean_name.replace("_", " ").replace("-", " ")
+                valid_sources.append({"name": name, "description": clean_name})
+
+        default_source = await Plugin.get_default_mic(self)
+        default_label_suffix = ""
+        for s in valid_sources:
+            if s["name"] == default_source:
+                default_label_suffix = f" ({s['description']})"
+                break
+
+        options = [
+            {"data": "default", "label": f"Default Mic{default_label_suffix}"}
+        ]
+
+        for s in valid_sources:
+            options.append({
+                "data": s["name"],
+                "label": s["description"]
+            })
+
+        logger.debug(f"Detected {len(valid_sources)} microphones: {[s['name'] for s in valid_sources]}")
+        return options
+
     async def is_mic_enabled(self):
         return self._micEnabled
 
@@ -923,18 +1054,29 @@ class Plugin:
     async def attach_mic(self):
         logger.debug(f"Attaching Microphone {self._echoCancelledMicName}")
 
-        if self._micSource == "NA":
-            self._micSource = await Plugin.get_default_mic(self)
+        default_mic = await Plugin.get_default_mic(self)
+        mic_to_use = self._micSource
+        if not mic_to_use or mic_to_use in ("NA", "default", "auto"):
+            mic_to_use = default_mic
+
+        if mic_to_use and mic_to_use != "auto":
+            available = await Plugin.get_raw_source_names(self)
+            if available and mic_to_use not in available:
+                logger.warning(f"Configured mic '{mic_to_use}' not found in available sources ({available}), falling back to default mic '{default_mic}'")
+                mic_to_use = default_mic
+
+        logger.info(f"Using audio input source for mic loopback: {mic_to_use}")
+        source_opt = f"source={mic_to_use}" if (mic_to_use and mic_to_use != "auto") else ""
 
         if await Plugin.enhanced_noise_binary_exists(self):
             get_cmd_output(f"pactl load-module module-null-sink sink_name={self._echoCancelledMicName} rate=48000")
             get_cmd_output(f"pactl load-module module-ladspa-sink sink_name={self._echoCancelledMicName}_raw_in sink_master={self._echoCancelledMicName} label=noise_suppressor_mono plugin={self._optional_denoise_binary_path} control={self._noiseReductionPercent},20,0,0,0")
-            get_cmd_output(f"pactl load-module module-loopback source={self._micSource} sink={self._echoCancelledMicName}_raw_in channels=1 source_dont_move=true sink_dont_move=true")
+            get_cmd_output(f"pactl load-module module-loopback {source_opt} sink={self._echoCancelledMicName}_raw_in channels=1 source_dont_move=true sink_dont_move=true")
             get_cmd_output(f"pactl set-source-volume {self._echoCancelledMicName}.monitor {self._micGain}db")
             get_cmd_output(f"pactl load-module module-loopback source={self._echoCancelledMicName}.monitor sink={self._deckySinkModuleName} source_dont_move=true sink_dont_move=true")
         else:
             get_cmd_output(f"pactl load-module module-null-sink sink_name={self._echoCancelledMicName} rate=48000")
-            get_cmd_output(f"pactl load-module module-loopback source={self._micSource} sink={self._echoCancelledMicName} channels=1 source_dont_move=true sink_dont_move=true")
+            get_cmd_output(f"pactl load-module module-loopback {source_opt} sink={self._echoCancelledMicName} channels=1 source_dont_move=true sink_dont_move=true")
             get_cmd_output(f"pactl set-source-volume {self._echoCancelledMicName}.monitor {self._micGain}db")
             get_cmd_output(f"pactl load-module module-loopback source={self._echoCancelledMicName}.monitor sink={self._deckySinkModuleName} source_dont_move=true sink_dont_move=true")
 
@@ -969,7 +1111,6 @@ class Plugin:
         await Plugin.saveConfig(self)
 
     async def enhanced_noise_binary_exists(self):
-        # Check bundled path first, then legacy user-data path
         if os.path.exists(self._bundled_denoise_binary_path):
             self._optional_denoise_binary_path = self._bundled_denoise_binary_path
             return True
@@ -994,18 +1135,13 @@ class Plugin:
 
     async def get_mic_sources(self):
         import json
-        raw_output = get_cmd_output("pactl list short sources | awk '{print $2}'", log=False)
-        raw_sources = [s.strip() for s in raw_output.split("\n") if s.strip()] if raw_output else []
-        default_source = await Plugin.get_default_mic(self)
-        sources_json = [{"data": default_source, "label": "Default Mic"}]
-        for source in raw_sources:
-            if "Echo" not in source and "monitor" not in source and "Decky" not in source and source != default_source:
-                sources_json.append({"data": source, "label": source})
-        return json.dumps(sources_json)
+        options = await Plugin.detect_microphones(self)
+        return json.dumps(options)
 
     async def set_mic_source(self, new_mic_source: str):
         logger.debug(f"Setting mic source: {new_mic_source}")
         self._micSource = new_mic_source
+        await Plugin.saveConfig(self)
         if await Plugin.is_streaming(self):
             if await Plugin.is_mic_enabled(self):
                 await Plugin.detach_mic(self)
@@ -1114,6 +1250,7 @@ class Plugin:
         self._micEnabled = self._settings.getSetting("mic_enabled", False)
         self._micGain = self._settings.getSetting("mic_gain", 13.0)
         self._noiseReductionPercent = self._settings.getSetting("noise_reduction_percent", 50)
+        self._micSource = self._settings.getSetting("mic_source", "default")
 
         await Plugin.saveConfig(self)
         return
@@ -1131,11 +1268,14 @@ class Plugin:
         self._settings.setSetting("mic_enabled", self._micEnabled)
         self._settings.setSetting("mic_gain", self._micGain)
         self._settings.setSetting("noise_reduction_percent", self._noiseReductionPercent)
+        self._settings.setSetting("mic_source", self._micSource)
         return
 
     async def _main(self):
-        os.environ["XDG_RUNTIME_DIR"] = "/run/user/1000"
-        os.environ["PULSE_SERVER"] = "unix:/run/user/1000/pulse/native"
+        env = get_pulse_env()
+        os.environ["XDG_RUNTIME_DIR"] = env.get("XDG_RUNTIME_DIR", "/run/user/1000")
+        if "PULSE_SERVER" in env:
+            os.environ["PULSE_SERVER"] = env["PULSE_SERVER"]
         os.environ["HOME"] = decky_plugin.DECKY_USER_HOME
         loop = asyncio.get_event_loop()
         self._watchdog_task = loop.create_task(Plugin.watchdog(self))
