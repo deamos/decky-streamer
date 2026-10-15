@@ -22,7 +22,7 @@ import {
   useEffect
 } from "react";
 
-import { FaBroadcastTower } from "react-icons/fa";
+import { FaBroadcastTower, FaSync } from "react-icons/fa";
 
 // Streaming platform presets
 const STREAMING_PLATFORMS = {
@@ -123,8 +123,16 @@ class DeckyStreamerLogic {
     await this.serverAPI.callPluginMethod('update_noise_reduction_percent', { new_percent: newNoiseReductionPercent });
   }
 
-  getParsedMicSources = async () => {
-    return JSON.parse((await this.serverAPI.callPluginMethod('get_mic_sources', {})).result as string);
+  getParsedMicSources = async (): Promise<SingleDropdownOption[]> => {
+    const res = await this.serverAPI.callPluginMethod('get_mic_sources', {});
+    if (typeof res.result === 'string') {
+      try {
+        return JSON.parse(res.result);
+      } catch {
+        return [{ data: "default", label: "Default Mic" }];
+      }
+    }
+    return (res.result as SingleDropdownOption[]) || [{ data: "default", label: "Default Mic" }];
   }
 }
 
@@ -139,8 +147,9 @@ const DeckyStreamer: VFC<{ serverAPI: ServerAPI, logic: DeckyStreamerLogic }> = 
   const [micGain, setMicGain] = useState(13);
   const [isEnhancedNoiseCancellation, setEnhancedNoiseCancellation] = useState(false);
   const [noiseReductionPercent, setNoiseReductionPercent] = useState(50);
-  const [micSource, setMicSource] = useState({ data: "NA", label: "Default Mic" });
-  const [micSourcesList, setMicSourcesList] = useState([{ data: "NA", label: "Default Mic" }]);
+  const [micSource, setMicSource] = useState<SingleDropdownOption>({ data: "default", label: "Default Mic" });
+  const [micSourcesList, setMicSourcesList] = useState<SingleDropdownOption[]>([{ data: "default", label: "Default Mic" }]);
+  const [isDetectingMics, setIsDetectingMics] = useState(false);
 
   // Stream settings
   const [selectedPlatform, setSelectedPlatform] = useState("twitch");
@@ -192,15 +201,25 @@ const DeckyStreamer: VFC<{ serverAPI: ServerAPI, logic: DeckyStreamerLogic }> = 
       const getNoiseReductionPercent = await serverAPI.callPluginMethod('get_noise_reduction_percent', {});
       setNoiseReductionPercent(typeof getNoiseReductionPercent.result === 'number' ? getNoiseReductionPercent.result : 50);
 
-      let getMicSource = await serverAPI.callPluginMethod('get_mic_source', {});
-      const micSourceResult = getMicSource.result as string;
-      if (!micSourceResult || micSourceResult === "NA") {
-        getMicSource = await serverAPI.callPluginMethod('get_default_mic', {});
-        setMicSource({ data: getMicSource.result as string || "NA", label: "Default Mic" });
-      } else if (micSourceResult.includes("alsa_input")) {
-        setMicSource({ data: micSourceResult, label: "Default Mic" });
+      // Load mic sources
+      let initialSources: SingleDropdownOption[] = [{ data: "default", label: "Default Mic" }];
+      try {
+        const loadedSources = await logic.getParsedMicSources();
+        if (loadedSources && loadedSources.length > 0) {
+          initialSources = loadedSources;
+          setMicSourcesList(loadedSources);
+        }
+      } catch (err) {
+        console.error("Failed to load initial mic sources", err);
+      }
+
+      const getMicSource = await serverAPI.callPluginMethod('get_mic_source', {});
+      const savedMicSource = (getMicSource.result as string) || "default";
+      const matched = initialSources.find(s => s.data === savedMicSource);
+      if (matched) {
+        setMicSource(matched);
       } else {
-        setMicSource({ data: micSourceResult, label: micSourceResult });
+        setMicSource(initialSources[0]);
       }
 
       // Load stream settings
@@ -358,10 +377,58 @@ const DeckyStreamer: VFC<{ serverAPI: ServerAPI, logic: DeckyStreamerLogic }> = 
     logic.updateNoiseReductionPercent(noiseReductionPercent);
   };
 
-  const getMicSources = async () => {
-    const parsedMicSources = await logic.getParsedMicSources();
-    setMicSourcesList(parsedMicSources);
+  // Active background microphone polling while microphone is enabled
+  useEffect(() => {
+    if (!microphoneEnabled) return;
+    const interval = setInterval(async () => {
+      try {
+        const updated = await logic.getParsedMicSources();
+        if (updated && updated.length > 0) {
+          setMicSourcesList(updated);
+          setMicSource((current) => {
+            const exists = updated.find(s => s.data === current.data);
+            return exists || updated[0];
+          });
+        }
+      } catch (err) {
+        console.error("Background mic poll error", err);
+      }
+    }, 4000);
+    return () => clearInterval(interval);
+  }, [microphoneEnabled]);
+
+  const detectMicrophones = async () => {
+    setIsDetectingMics(true);
+    try {
+      const updated = await logic.getParsedMicSources();
+      if (updated && updated.length > 0) {
+        setMicSourcesList(updated);
+        setMicSource((current) => {
+          const exists = updated.find(s => s.data === current.data);
+          return exists || updated[0];
+        });
+
+        const physicalCount = updated.filter(s => s.data !== "default").length;
+        serverAPI.toaster.toast({
+          title: "Microphone Detection",
+          body: physicalCount > 0
+            ? `Found ${physicalCount} microphone(s)`
+            : "No external mics found, using default",
+          duration: 3000
+        });
+      }
+    } catch (err) {
+      serverAPI.toaster.toast({
+        title: "Detection Failed",
+        body: "Unable to query microphones",
+        duration: 3000
+      });
+    } finally {
+      setIsDetectingMics(false);
+    }
   };
+
+
 
   const getStreamButtonText = (): string => {
     if (!isStreaming) {
@@ -737,11 +804,7 @@ const DeckyStreamer: VFC<{ serverAPI: ServerAPI, logic: DeckyStreamerLogic }> = 
               <Dropdown
                 rgOptions={micSourcesList}
                 selectedOption={micSourcesList.find(m => m.data === micSource.data) || micSourcesList[0]}
-                strDefaultLabel={micSource.label || "Default Mic"}
-                onMenuWillOpen={async (showMenu: () => void) => {
-                  await getMicSources();
-                  showMenu();
-                }}
+                strDefaultLabel={(micSource.label as string) || "Default Mic"}
                 onChange={(newSource) => {
                   setMicSource({ data: newSource.data as string, label: newSource.label as string });
                   serverAPI.callPluginMethod('set_mic_source', { new_mic_source: newSource.data });
@@ -749,8 +812,20 @@ const DeckyStreamer: VFC<{ serverAPI: ServerAPI, logic: DeckyStreamerLogic }> = 
               />
             </PanelSectionRow>
             <PanelSectionRow>
+              <ButtonItem
+                layout="below"
+                onClick={detectMicrophones}
+                disabled={isDetectingMics}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px' }}>
+                  <FaSync className={isDetectingMics ? "spinning" : ""} />
+                  <span>{isDetectingMics ? "Detecting Microphones..." : "Detect Microphones"}</span>
+                </div>
+              </ButtonItem>
+            </PanelSectionRow>
+            <PanelSectionRow>
               <div style={{ fontSize: '12px', color: '#888' }}>
-                Select the Microphone Source
+                Select a specific microphone or leave on default. Click Detect Microphones if your USB mic is not listed.
               </div>
             </PanelSectionRow>
           </>
