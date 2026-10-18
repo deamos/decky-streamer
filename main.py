@@ -377,12 +377,16 @@ class Plugin:
     _audioBitrate: int = 160  # kbps
     _resolution: str = "720p"  # 720p, 1080p
     _framerate: int = 60
-    _keyframeInterval: int = 0  # 0 = use encoder default (typically 30), otherwise specific value
+    _keyframeInterval: int = 2  # Keyframe interval in seconds (2s per Twitch guidelines)
     _bframes: int = 0  # 0 = use encoder default, otherwise specific value (0-3)
     _micEnabled: bool = False
     _micGain: float = 13.0
     _noiseReductionPercent: int = 50
     _micSource: str = "default"
+    _profiles: list = []
+    _activeProfileId: str = ""
+    _rateControl: str = "cbr"  # cbr | vbr
+    _encoderPreset: str = "veryfast"  # ultrafast, superfast, veryfast, faster, fast, medium
     _deckySinkModuleName: str = "Decky-Streaming-Sink"
     _echoCancelledAudioName: str = "Echo-Cancelled-Audio"
     _echoCancelledMicName: str = "Echo-Cancelled-Mic"
@@ -649,21 +653,41 @@ class Plugin:
                     f"[stream:{self._stream_session_id}] Using recovery framerate {effective_fps}fps (requested {requested_fps}fps)"
                 )
 
+            # Keyframe interval in seconds (Twitch strictly requires 2.0s)
+            keyframe_sec = self._keyframeInterval if self._keyframeInterval > 0 else 2
+            keyint_frames = max(1, int(keyframe_sec * effective_fps))
+
+            rate_mode = self._rateControl if self._rateControl in ["cbr", "vbr"] else "cbr"
+            preset = self._encoderPreset if self._encoderPreset else "veryfast"
+
             encoder = "vaapih264enc"
-            encoder_opts = f"bitrate={self._videoBitrate}"
-            if self._keyframeInterval > 0:
-                encoder_opts += f" keyframe-period={self._keyframeInterval}"
+            if rate_mode == "cbr":
+                encoder_opts = f"rate-control=cbr bitrate={self._videoBitrate} keyframe-period={keyint_frames}"
+            else:
+                encoder_opts = f"rate-control=vbr bitrate={self._videoBitrate} target-percentage=75 keyframe-period={keyint_frames}"
+
             if self._bframes > 0:
                 encoder_opts += f" max-bframes={self._bframes}"
 
-            # After repeated RTMP disconnects, switch to software encoder for safer timestamps.
+            preset_quality_map = {
+                "ultrafast": 7,
+                "superfast": 7,
+                "veryfast": 4,
+                "faster": 4,
+                "fast": 2,
+                "medium": 1
+            }
+            if preset in preset_quality_map:
+                encoder_opts += f" quality-level={preset_quality_map[preset]}"
+
+            # Software encoder fallback (e.g. if VA-API has repeated disconnects)
             if self._force_software_encoder or not _gst_has_element("vaapih264enc"):
                 encoder = "x264enc" if _gst_has_element("x264enc") else "vaapih264enc"
                 if encoder == "x264enc":
-                    keyint = self._keyframeInterval if self._keyframeInterval > 0 else effective_fps
                     encoder_opts = (
-                        f"bitrate={self._videoBitrate} tune=zerolatency speed-preset=veryfast "
-                        f"key-int-max={max(1, keyint)} bframes=0"
+                        f"pass={rate_mode} bitrate={self._videoBitrate} "
+                        f"speed-preset={preset} tune=zerolatency "
+                        f"key-int-max={keyint_frames} bframes={self._bframes}"
                     )
 
             logger.info(
@@ -947,19 +971,43 @@ class Plugin:
         return int(time.time() - self._stream_start_time)
 
     # Audio sink management
+    async def get_real_default_sink(self):
+        output = get_cmd_output("pactl get-default-sink", log=False)
+        if output and self._deckySinkModuleName not in output and "Echo" not in output:
+            return output
+        raw_output = get_cmd_output("pactl list short sinks | awk '{print $2}'", log=False)
+        if raw_output:
+            for s in [line.strip() for line in raw_output.splitlines() if line.strip()]:
+                if self._deckySinkModuleName not in s and "Echo" not in s:
+                    return s
+        return output or "auto"
+
     async def create_decky_pa_sink(self):
         logger.debug("Creating audio pipeline")
-        audio_device_output = get_cmd_output("pactl get-default-sink", log=False)
+        await Plugin.cleanup_decky_pa_sink(self)
+
+        audio_device_output = await Plugin.get_real_default_sink(self)
+        logger.info(f"Using default audio sink for stream game audio: {audio_device_output}")
 
         get_cmd_output(f"pactl load-module module-null-sink sink_name={self._deckySinkModuleName} rate=48000")
-        get_cmd_output(f"pactl load-module module-loopback source={audio_device_output}.monitor sink={self._deckySinkModuleName} latency_msec=30 adjust_time=0 source_dont_move=true sink_dont_move=true")
+        source_arg = f"source={audio_device_output}.monitor" if audio_device_output and audio_device_output != "auto" else ""
+        get_cmd_output(
+            f"pactl load-module module-loopback {source_arg} sink={self._deckySinkModuleName} "
+            f"latency_msec=30 adjust_time=0 source_dont_move=true sink_dont_move=true "
+            f"sink_input_properties=\"target.object='{self._deckySinkModuleName}' node.passive=true\""
+        )
 
         if await Plugin.is_mic_enabled(self):
             await Plugin.attach_mic(self)
 
     async def cleanup_decky_pa_sink(self):
+        current_default = get_cmd_output("pactl get-default-sink", log=False)
         unload_pa_modules("Echo-Cancelled")
         unload_pa_modules(f"{self._deckySinkModuleName}")
+        if current_default and (self._deckySinkModuleName in current_default or "Echo" in current_default):
+            fallback_sink = await Plugin.get_real_default_sink(self)
+            if fallback_sink and fallback_sink != "auto":
+                get_cmd_output(f"pactl set-default-sink {fallback_sink}", log=False)
 
     # Microphone management
     async def get_default_mic(self):
@@ -1068,17 +1116,22 @@ class Plugin:
         logger.info(f"Using audio input source for mic loopback: {mic_to_use}")
         source_opt = f"source={mic_to_use}" if (mic_to_use and mic_to_use != "auto") else ""
 
-        if await Plugin.enhanced_noise_binary_exists(self):
-            get_cmd_output(f"pactl load-module module-null-sink sink_name={self._echoCancelledMicName} rate=48000")
-            get_cmd_output(f"pactl load-module module-ladspa-sink sink_name={self._echoCancelledMicName}_raw_in sink_master={self._echoCancelledMicName} label=noise_suppressor_mono plugin={self._optional_denoise_binary_path} control={self._noiseReductionPercent},20,0,0,0")
-            get_cmd_output(f"pactl load-module module-loopback {source_opt} sink={self._echoCancelledMicName}_raw_in channels=1 source_dont_move=true sink_dont_move=true")
-            get_cmd_output(f"pactl set-source-volume {self._echoCancelledMicName}.monitor {self._micGain}db")
-            get_cmd_output(f"pactl load-module module-loopback source={self._echoCancelledMicName}.monitor sink={self._deckySinkModuleName} source_dont_move=true sink_dont_move=true")
-        else:
-            get_cmd_output(f"pactl load-module module-null-sink sink_name={self._echoCancelledMicName} rate=48000")
-            get_cmd_output(f"pactl load-module module-loopback {source_opt} sink={self._echoCancelledMicName} channels=1 source_dont_move=true sink_dont_move=true")
-            get_cmd_output(f"pactl set-source-volume {self._echoCancelledMicName}.monitor {self._micGain}db")
-            get_cmd_output(f"pactl load-module module-loopback source={self._echoCancelledMicName}.monitor sink={self._deckySinkModuleName} source_dont_move=true sink_dont_move=true")
+        # Unload any existing mic modules to ensure a clean state
+        unload_pa_modules("Echo-Cancelled")
+
+        # Route microphone strictly to isolated null sink (never to default speakers)
+        get_cmd_output(f"pactl load-module module-null-sink sink_name={self._echoCancelledMicName} rate=48000")
+        get_cmd_output(
+            f"pactl load-module module-loopback {source_opt} sink={self._echoCancelledMicName} "
+            f"channels=1 source_dont_move=true sink_dont_move=true "
+            f"sink_input_properties=\"target.object='{self._echoCancelledMicName}' node.passive=true\""
+        )
+        get_cmd_output(f"pactl set-source-volume {self._echoCancelledMicName}.monitor {self._micGain}db")
+        get_cmd_output(
+            f"pactl load-module module-loopback source={self._echoCancelledMicName}.monitor "
+            f"sink={self._deckySinkModuleName} source_dont_move=true sink_dont_move=true "
+            f"sink_input_properties=\"target.object='{self._deckySinkModuleName}' node.passive=true\""
+        )
 
     async def detach_mic(self):
         logger.debug(f"Detaching Microphone {self._echoCancelledMicName}")
@@ -1111,12 +1164,8 @@ class Plugin:
         await Plugin.saveConfig(self)
 
     async def enhanced_noise_binary_exists(self):
-        if os.path.exists(self._bundled_denoise_binary_path):
-            self._optional_denoise_binary_path = self._bundled_denoise_binary_path
-            return True
-        if os.path.exists(self._legacy_denoise_binary_path):
-            self._optional_denoise_binary_path = self._legacy_denoise_binary_path
-            return True
+        # Disabled: module-ladspa-sink causes PipeWire/WirePlumber to route mic audio
+        # directly to default hardware speakers as a smart filter sink.
         return False
 
     async def get_noise_reduction_percent(self):
@@ -1124,10 +1173,6 @@ class Plugin:
 
     async def update_noise_reduction_percent(self, new_percent: int):
         self._noiseReductionPercent = int(new_percent)
-        if await Plugin.is_streaming(self):
-            if await Plugin.is_mic_enabled(self):
-                await Plugin.detach_mic(self)
-                await Plugin.attach_mic(self)
         await Plugin.saveConfig(self)
 
     async def get_mic_source(self):
@@ -1182,6 +1227,8 @@ class Plugin:
         return ""
 
     async def set_stream_key(self, stream_key: str):
+        if stream_key == "*" * 8:
+            return
         self._streamKey = stream_key
         await Plugin.saveConfig(self)
 
@@ -1232,30 +1279,137 @@ class Plugin:
         self._bframes = int(bframes)
         await Plugin.saveConfig(self)
 
+    async def get_rate_control(self):
+        return self._rateControl
+
+    async def set_rate_control(self, rate_control: str):
+        if rate_control in ["cbr", "vbr"]:
+            self._rateControl = rate_control
+            await Plugin.saveConfig(self)
+
+    async def get_encoder_preset(self):
+        return self._encoderPreset
+
+    async def set_encoder_preset(self, preset: str):
+        valid_presets = ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium"]
+        if preset in valid_presets:
+            self._encoderPreset = preset
+            await Plugin.saveConfig(self)
+
     # Config management
     async def loadConfig(self):
         logger.debug("Loading settings")
         self._settings = SettingsManager(name="decky-streamer-settings", settings_directory=settingsDir)
         self._settings.read()
 
-        self._platform = self._settings.getSetting("platform", "twitch")
-        self._customRtmpUrl = self._settings.getSetting("custom_rtmp_url", "")
-        self._streamKey = self._settings.getSetting("stream_key", "")
-        self._videoBitrate = self._settings.getSetting("video_bitrate", 4500)
-        self._audioBitrate = self._settings.getSetting("audio_bitrate", 160)
-        self._resolution = self._settings.getSetting("resolution", "720p")
-        self._framerate = self._settings.getSetting("framerate", 60)
-        self._keyframeInterval = self._settings.getSetting("keyframe_interval", 0)
-        self._bframes = self._settings.getSetting("bframes", 0)
-        self._micEnabled = self._settings.getSetting("mic_enabled", False)
-        self._micGain = self._settings.getSetting("mic_gain", 13.0)
-        self._noiseReductionPercent = self._settings.getSetting("noise_reduction_percent", 50)
-        self._micSource = self._settings.getSetting("mic_source", "default")
+        raw_profiles = self._settings.getSetting("profiles")
+        active_id = self._settings.getSetting("active_profile_id")
+
+        if not raw_profiles or not isinstance(raw_profiles, list) or len(raw_profiles) == 0:
+            logger.info("Migrating existing configuration to initial profile")
+            existing_platform = self._settings.getSetting("platform", "twitch")
+            profile_name = "Default"
+            if existing_platform == "custom":
+                profile_name = "Custom RTMP"
+            elif existing_platform in ["twitch", "youtube", "kick", "facebook"]:
+                profile_name = existing_platform.capitalize()
+
+            raw_kf = self._settings.getSetting("keyframe_interval", 2)
+            kf_sec = 2 if raw_kf > 10 or raw_kf <= 0 else raw_kf
+            migrated_profile = {
+                "id": "default",
+                "name": profile_name,
+                "platform": existing_platform,
+                "custom_rtmp_url": self._settings.getSetting("custom_rtmp_url", ""),
+                "stream_key": self._settings.getSetting("stream_key", ""),
+                "video_bitrate": self._settings.getSetting("video_bitrate", 4500),
+                "audio_bitrate": self._settings.getSetting("audio_bitrate", 160),
+                "resolution": self._settings.getSetting("resolution", "720p"),
+                "framerate": self._settings.getSetting("framerate", 60),
+                "rate_control": self._settings.getSetting("rate_control", "cbr"),
+                "keyframe_interval": kf_sec,
+                "encoder_preset": self._settings.getSetting("encoder_preset", "veryfast"),
+                "bframes": self._settings.getSetting("bframes", 0),
+                "mic_enabled": self._settings.getSetting("mic_enabled", False),
+                "mic_gain": self._settings.getSetting("mic_gain", 13.0),
+                "noise_reduction_percent": self._settings.getSetting("noise_reduction_percent", 50),
+                "mic_source": self._settings.getSetting("mic_source", "default"),
+            }
+            self._profiles = [migrated_profile]
+            self._activeProfileId = "default"
+        else:
+            self._profiles = raw_profiles
+            self._activeProfileId = active_id if active_id else self._profiles[0].get("id", "default")
+
+        # Ensure active profile exists
+        active_profile = next((p for p in self._profiles if p.get("id") == self._activeProfileId), None)
+        if not active_profile and self._profiles:
+            active_profile = self._profiles[0]
+            self._activeProfileId = active_profile.get("id", "default")
+
+        if active_profile:
+            self._platform = active_profile.get("platform", "twitch")
+            self._customRtmpUrl = active_profile.get("custom_rtmp_url", "")
+            self._streamKey = active_profile.get("stream_key", "")
+            self._videoBitrate = active_profile.get("video_bitrate", 4500)
+            self._audioBitrate = active_profile.get("audio_bitrate", 160)
+            self._resolution = active_profile.get("resolution", "720p")
+            self._framerate = active_profile.get("framerate", 60)
+            self._rateControl = active_profile.get("rate_control", "cbr")
+            raw_kf = active_profile.get("keyframe_interval", 2)
+            self._keyframeInterval = 2 if raw_kf > 10 or raw_kf <= 0 else raw_kf
+            self._encoderPreset = active_profile.get("encoder_preset", "veryfast")
+            self._bframes = active_profile.get("bframes", 0)
+            self._micEnabled = active_profile.get("mic_enabled", False)
+            self._micGain = active_profile.get("mic_gain", 13.0)
+            self._noiseReductionPercent = active_profile.get("noise_reduction_percent", 50)
+            self._micSource = active_profile.get("mic_source", "default")
+        else:
+            self._platform = "twitch"
+            self._customRtmpUrl = ""
+            self._streamKey = ""
+            self._videoBitrate = 4500
+            self._audioBitrate = 160
+            self._resolution = "720p"
+            self._framerate = 60
+            self._rateControl = "cbr"
+            self._keyframeInterval = 2
+            self._encoderPreset = "veryfast"
+            self._bframes = 0
+            self._micEnabled = False
+            self._micGain = 13.0
+            self._noiseReductionPercent = 50
+            self._micSource = "default"
 
         await Plugin.saveConfig(self)
         return
 
     async def saveConfig(self):
+        # Update the active profile in self._profiles
+        if self._activeProfileId and self._profiles:
+            for p in self._profiles:
+                if p.get("id") == self._activeProfileId:
+                    p["platform"] = self._platform
+                    p["custom_rtmp_url"] = self._customRtmpUrl
+                    p["stream_key"] = self._streamKey
+                    p["video_bitrate"] = self._videoBitrate
+                    p["audio_bitrate"] = self._audioBitrate
+                    p["resolution"] = self._resolution
+                    p["framerate"] = self._framerate
+                    p["rate_control"] = self._rateControl
+                    p["keyframe_interval"] = self._keyframeInterval
+                    p["encoder_preset"] = self._encoderPreset
+                    p["bframes"] = self._bframes
+                    p["mic_enabled"] = self._micEnabled
+                    p["mic_gain"] = self._micGain
+                    p["noise_reduction_percent"] = self._noiseReductionPercent
+                    p["mic_source"] = self._micSource
+                    break
+
+        self._settings.setSetting("profiles", self._profiles)
+        self._settings.setSetting("active_profile_id", self._activeProfileId)
+
+        # Maintain flat settings for backwards compatibility
         self._settings.setSetting("platform", self._platform)
         self._settings.setSetting("custom_rtmp_url", self._customRtmpUrl)
         self._settings.setSetting("stream_key", self._streamKey)
@@ -1263,13 +1417,228 @@ class Plugin:
         self._settings.setSetting("audio_bitrate", self._audioBitrate)
         self._settings.setSetting("resolution", self._resolution)
         self._settings.setSetting("framerate", self._framerate)
+        self._settings.setSetting("rate_control", self._rateControl)
         self._settings.setSetting("keyframe_interval", self._keyframeInterval)
+        self._settings.setSetting("encoder_preset", self._encoderPreset)
         self._settings.setSetting("bframes", self._bframes)
         self._settings.setSetting("mic_enabled", self._micEnabled)
         self._settings.setSetting("mic_gain", self._micGain)
         self._settings.setSetting("noise_reduction_percent", self._noiseReductionPercent)
         self._settings.setSetting("mic_source", self._micSource)
         return
+
+    # Profile management
+    async def get_profiles(self):
+        """Return list of profiles with masked stream keys"""
+        safe_profiles = []
+        for p in self._profiles:
+            safe_p = dict(p)
+            has_key = bool(safe_p.get("stream_key"))
+            safe_p["has_stream_key"] = has_key
+            safe_p["stream_key"] = ("*" * 8) if has_key else ""
+            safe_profiles.append(safe_p)
+        return safe_profiles
+
+    async def get_active_profile_id(self):
+        return self._activeProfileId
+
+    async def switch_profile(self, profile_id: str):
+        if await Plugin.is_streaming(self):
+            return {"success": False, "error": "Cannot switch profile while streaming"}
+
+        target = next((p for p in self._profiles if p.get("id") == profile_id), None)
+        if not target:
+            return {"success": False, "error": "Profile not found"}
+
+        self._activeProfileId = profile_id
+        self._platform = target.get("platform", "twitch")
+        self._customRtmpUrl = target.get("custom_rtmp_url", "")
+        self._streamKey = target.get("stream_key", "")
+        self._videoBitrate = target.get("video_bitrate", 4500)
+        self._audioBitrate = target.get("audio_bitrate", 160)
+        self._resolution = target.get("resolution", "720p")
+        self._framerate = target.get("framerate", 60)
+        self._rateControl = target.get("rate_control", "cbr")
+        raw_kf = target.get("keyframe_interval", 2)
+        self._keyframeInterval = 2 if raw_kf > 10 or raw_kf <= 0 else raw_kf
+        self._encoderPreset = target.get("encoder_preset", "veryfast")
+        self._bframes = target.get("bframes", 0)
+        self._micEnabled = target.get("mic_enabled", False)
+        self._micGain = target.get("mic_gain", 13.0)
+        self._noiseReductionPercent = target.get("noise_reduction_percent", 50)
+        self._micSource = target.get("mic_source", "default")
+
+        await Plugin.saveConfig(self)
+
+        return {
+            "success": True,
+            "active_profile_id": self._activeProfileId,
+            "settings": {
+                "platform": self._platform,
+                "custom_rtmp_url": self._customRtmpUrl,
+                "stream_key": ("*" * 8) if self._streamKey else "",
+                "video_bitrate": self._videoBitrate,
+                "audio_bitrate": self._audioBitrate,
+                "resolution": self._resolution,
+                "framerate": self._framerate,
+                "rate_control": self._rateControl,
+                "keyframe_interval": self._keyframeInterval,
+                "encoder_preset": self._encoderPreset,
+                "bframes": self._bframes,
+                "mic_enabled": self._micEnabled,
+                "mic_gain": self._micGain,
+                "noise_reduction_percent": self._noiseReductionPercent,
+                "mic_source": self._micSource,
+            }
+        }
+
+    async def create_profile(self, name: str, copy_current: bool = True):
+        if await Plugin.is_streaming(self):
+            return {"success": False, "error": "Cannot create profile while streaming"}
+
+        name = (name or "").strip() or "New Profile"
+        profile_id = f"profile_{int(time.time() * 1000)}"
+
+        new_profile = {
+            "id": profile_id,
+            "name": name,
+            "platform": self._platform if copy_current else "twitch",
+            "custom_rtmp_url": self._customRtmpUrl if copy_current else "",
+            "stream_key": self._streamKey if copy_current else "",
+            "video_bitrate": self._videoBitrate if copy_current else 4500,
+            "audio_bitrate": self._audioBitrate if copy_current else 160,
+            "resolution": self._resolution if copy_current else "720p",
+            "framerate": self._framerate if copy_current else 60,
+            "rate_control": self._rateControl if copy_current else "cbr",
+            "keyframe_interval": self._keyframeInterval if copy_current else 2,
+            "encoder_preset": self._encoderPreset if copy_current else "veryfast",
+            "bframes": self._bframes if copy_current else 0,
+            "mic_enabled": self._micEnabled if copy_current else False,
+            "mic_gain": self._micGain if copy_current else 13.0,
+            "noise_reduction_percent": self._noiseReductionPercent if copy_current else 50,
+            "mic_source": self._micSource if copy_current else "default",
+        }
+
+        self._profiles.append(new_profile)
+        self._activeProfileId = profile_id
+
+        self._platform = new_profile["platform"]
+        self._customRtmpUrl = new_profile["custom_rtmp_url"]
+        self._streamKey = new_profile["stream_key"]
+        self._videoBitrate = new_profile["video_bitrate"]
+        self._audioBitrate = new_profile["audio_bitrate"]
+        self._resolution = new_profile["resolution"]
+        self._framerate = new_profile["framerate"]
+        self._rateControl = new_profile["rate_control"]
+        self._keyframeInterval = new_profile["keyframe_interval"]
+        self._encoderPreset = new_profile["encoder_preset"]
+        self._bframes = new_profile["bframes"]
+        self._micEnabled = new_profile["mic_enabled"]
+        self._micGain = new_profile["mic_gain"]
+        self._noiseReductionPercent = new_profile["noise_reduction_percent"]
+        self._micSource = new_profile["mic_source"]
+
+        await Plugin.saveConfig(self)
+
+        return {
+            "success": True,
+            "active_profile_id": profile_id,
+            "profile": {
+                "id": new_profile["id"],
+                "name": new_profile["name"],
+                "platform": new_profile["platform"],
+                "custom_rtmp_url": new_profile["custom_rtmp_url"],
+                "has_stream_key": bool(new_profile["stream_key"]),
+                "stream_key": ("*" * 8) if new_profile["stream_key"] else "",
+            },
+            "settings": {
+                "platform": self._platform,
+                "custom_rtmp_url": self._customRtmpUrl,
+                "stream_key": ("*" * 8) if self._streamKey else "",
+                "video_bitrate": self._videoBitrate,
+                "audio_bitrate": self._audioBitrate,
+                "resolution": self._resolution,
+                "framerate": self._framerate,
+                "rate_control": self._rateControl,
+                "keyframe_interval": self._keyframeInterval,
+                "encoder_preset": self._encoderPreset,
+                "bframes": self._bframes,
+                "mic_enabled": self._micEnabled,
+                "mic_gain": self._micGain,
+                "noise_reduction_percent": self._noiseReductionPercent,
+                "mic_source": self._micSource,
+            }
+        }
+
+    async def rename_profile(self, profile_id: str, new_name: str):
+        new_name = (new_name or "").strip()
+        if not new_name:
+            return {"success": False, "error": "Profile name cannot be empty"}
+
+        target = next((p for p in self._profiles if p.get("id") == profile_id), None)
+        if not target:
+            return {"success": False, "error": "Profile not found"}
+
+        target["name"] = new_name
+        await Plugin.saveConfig(self)
+        return {"success": True, "name": new_name}
+
+    async def delete_profile(self, profile_id: str):
+        if await Plugin.is_streaming(self):
+            return {"success": False, "error": "Cannot delete profile while streaming"}
+
+        if len(self._profiles) <= 1:
+            return {"success": False, "error": "Cannot delete the only profile"}
+
+        target = next((p for p in self._profiles if p.get("id") == profile_id), None)
+        if not target:
+            return {"success": False, "error": "Profile not found"}
+
+        self._profiles = [p for p in self._profiles if p.get("id") != profile_id]
+
+        if self._activeProfileId == profile_id:
+            next_profile = self._profiles[0]
+            self._activeProfileId = next_profile["id"]
+            self._platform = next_profile.get("platform", "twitch")
+            self._customRtmpUrl = next_profile.get("custom_rtmp_url", "")
+            self._streamKey = next_profile.get("stream_key", "")
+            self._videoBitrate = next_profile.get("video_bitrate", 4500)
+            self._audioBitrate = next_profile.get("audio_bitrate", 160)
+            self._resolution = next_profile.get("resolution", "720p")
+            self._framerate = next_profile.get("framerate", 60)
+            self._rateControl = next_profile.get("rate_control", "cbr")
+            raw_kf = next_profile.get("keyframe_interval", 2)
+            self._keyframeInterval = 2 if raw_kf > 10 or raw_kf <= 0 else raw_kf
+            self._encoderPreset = next_profile.get("encoder_preset", "veryfast")
+            self._bframes = next_profile.get("bframes", 0)
+            self._micEnabled = next_profile.get("mic_enabled", False)
+            self._micGain = next_profile.get("mic_gain", 13.0)
+            self._noiseReductionPercent = next_profile.get("noise_reduction_percent", 50)
+            self._micSource = next_profile.get("mic_source", "default")
+
+        await Plugin.saveConfig(self)
+
+        return {
+            "success": True,
+            "active_profile_id": self._activeProfileId,
+            "settings": {
+                "platform": self._platform,
+                "custom_rtmp_url": self._customRtmpUrl,
+                "stream_key": ("*" * 8) if self._streamKey else "",
+                "video_bitrate": self._videoBitrate,
+                "audio_bitrate": self._audioBitrate,
+                "resolution": self._resolution,
+                "framerate": self._framerate,
+                "rate_control": self._rateControl,
+                "keyframe_interval": self._keyframeInterval,
+                "encoder_preset": self._encoderPreset,
+                "bframes": self._bframes,
+                "mic_enabled": self._micEnabled,
+                "mic_gain": self._micGain,
+                "noise_reduction_percent": self._noiseReductionPercent,
+                "mic_source": self._micSource,
+            }
+        }
 
     async def _main(self):
         env = get_pulse_env()

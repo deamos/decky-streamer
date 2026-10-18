@@ -22,7 +22,15 @@ import {
   useEffect
 } from "react";
 
-import { FaBroadcastTower, FaSync } from "react-icons/fa";
+import { FaBroadcastTower, FaSync, FaPlus, FaEdit, FaTrash } from "react-icons/fa";
+
+interface StreamProfile {
+  id: string;
+  name: string;
+  platform: string;
+  custom_rtmp_url?: string;
+  has_stream_key?: boolean;
+}
 
 // Streaming platform presets
 const STREAMING_PLATFORMS = {
@@ -62,13 +70,29 @@ const FRAMERATE_OPTIONS: DropdownOption[] = [
   { data: 60, label: "60 fps" } as SingleDropdownOption
 ];
 
-// Keyframe interval options (0 = encoder default)
+// Rate control options (Twitch requires CBR)
+const RATE_CONTROL_OPTIONS: DropdownOption[] = [
+  { data: "cbr", label: "CBR (Constant - Recommended)" } as SingleDropdownOption,
+  { data: "vbr", label: "VBR (Variable Bitrate)" } as SingleDropdownOption
+];
+
+// Keyframe interval options in seconds (Twitch strictly requires 2s)
 const KEYFRAME_INTERVAL_OPTIONS: DropdownOption[] = [
-  { data: 0, label: "Default" } as SingleDropdownOption,
-  { data: 30, label: "30 (1s @ 30fps)" } as SingleDropdownOption,
-  { data: 60, label: "60 (2s @ 30fps)" } as SingleDropdownOption,
-  { data: 120, label: "120 (2s @ 60fps)" } as SingleDropdownOption,
-  { data: 250, label: "250 (~4s @ 60fps)" } as SingleDropdownOption
+  { data: 2, label: "2 seconds (Recommended)" } as SingleDropdownOption,
+  { data: 1, label: "1 second" } as SingleDropdownOption,
+  { data: 3, label: "3 seconds" } as SingleDropdownOption,
+  { data: 4, label: "4 seconds" } as SingleDropdownOption,
+  { data: 0, label: "Auto (Encoder Default)" } as SingleDropdownOption
+];
+
+// Encoder preset options
+const ENCODER_PRESET_OPTIONS: DropdownOption[] = [
+  { data: "ultrafast", label: "Ultrafast (Lowest CPU)" } as SingleDropdownOption,
+  { data: "superfast", label: "Superfast" } as SingleDropdownOption,
+  { data: "veryfast", label: "Veryfast (Recommended)" } as SingleDropdownOption,
+  { data: "faster", label: "Faster" } as SingleDropdownOption,
+  { data: "fast", label: "Fast" } as SingleDropdownOption,
+  { data: "medium", label: "Medium (Higher Quality)" } as SingleDropdownOption
 ];
 
 // B-frames options (0 = encoder default which is typically 0)
@@ -151,6 +175,10 @@ const DeckyStreamer: VFC<{ serverAPI: ServerAPI, logic: DeckyStreamerLogic }> = 
   const [micSourcesList, setMicSourcesList] = useState<SingleDropdownOption[]>([{ data: "default", label: "Default Mic" }]);
   const [isDetectingMics, setIsDetectingMics] = useState(false);
 
+  // Stream profiles
+  const [profiles, setProfiles] = useState<StreamProfile[]>([]);
+  const [activeProfileId, setActiveProfileId] = useState<string>("default");
+
   // Stream settings
   const [selectedPlatform, setSelectedPlatform] = useState("twitch");
   const [customRtmpUrl, setCustomRtmpUrl] = useState("");
@@ -161,7 +189,9 @@ const DeckyStreamer: VFC<{ serverAPI: ServerAPI, logic: DeckyStreamerLogic }> = 
   const [selectedFramerate, setSelectedFramerate] = useState(60);
 
   // Advanced settings
-  const [keyframeInterval, setKeyframeInterval] = useState(0);
+  const [rateControl, setRateControl] = useState("cbr");
+  const [keyframeInterval, setKeyframeInterval] = useState(2);
+  const [encoderPreset, setEncoderPreset] = useState("veryfast");
   const [bframes, setBframes] = useState(0);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [detectedResolution, setDetectedResolution] = useState("");
@@ -259,21 +289,138 @@ const DeckyStreamer: VFC<{ serverAPI: ServerAPI, logic: DeckyStreamerLogic }> = 
       setSelectedFramerate(validFramerates.includes(framerateResult) ? framerateResult : 60);
 
       // Load advanced settings
+      const getRateControl = await serverAPI.callPluginMethod('get_rate_control', {});
+      const rateResult = getRateControl.result as string;
+      setRateControl(["cbr", "vbr"].includes(rateResult) ? rateResult : "cbr");
+
       const getKeyframeInterval = await serverAPI.callPluginMethod('get_keyframe_interval', {});
       const keyframeResult = getKeyframeInterval.result as number;
-      const validKeyframes = [0, 30, 60, 120, 250];
-      setKeyframeInterval(validKeyframes.includes(keyframeResult) ? keyframeResult : 0);
+      const normKf = keyframeResult > 10 ? 2 : keyframeResult;
+      const validKeyframes = [0, 1, 2, 3, 4];
+      setKeyframeInterval(validKeyframes.includes(normKf) ? normKf : 2);
+
+      const getEncoderPreset = await serverAPI.callPluginMethod('get_encoder_preset', {});
+      const presetResult = getEncoderPreset.result as string;
+      const validPresets = ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium"];
+      setEncoderPreset(validPresets.includes(presetResult) ? presetResult : "veryfast");
 
       const getBframes = await serverAPI.callPluginMethod('get_bframes', {});
       const bframesResult = getBframes.result as number;
       const validBframes = [0, 1, 2, 3];
       setBframes(validBframes.includes(bframesResult) ? bframesResult : 0);
 
+      // Load stream profiles
+      try {
+        const profilesRes = await serverAPI.callPluginMethod('get_profiles', {});
+        const profilesList = (profilesRes.result as StreamProfile[]) || [];
+        setProfiles(profilesList);
+
+        const activeIdRes = await serverAPI.callPluginMethod('get_active_profile_id', {});
+        const activeId = (activeIdRes.result as string) || (profilesList[0]?.id || "default");
+        setActiveProfileId(activeId);
+      } catch (e) {
+        console.error("Failed to load stream profiles", e);
+      }
+
       // Get detected display resolution
       const getDetectedRes = await serverAPI.callPluginMethod('get_detected_resolution', {});
       setDetectedResolution(getDetectedRes.result as string || "");
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  const applySettings = (settings: any) => {
+    if (!settings) return;
+    if (settings.platform && Object.keys(STREAMING_PLATFORMS).includes(settings.platform)) {
+      setSelectedPlatform(settings.platform);
+    } else {
+      setSelectedPlatform("twitch");
+    }
+    setCustomRtmpUrl(settings.custom_rtmp_url || "");
+    setStreamKey(settings.stream_key || "");
+
+    if (typeof settings.video_bitrate === 'number' && settings.video_bitrate > 0) {
+      setVideoBitrate(settings.video_bitrate);
+    }
+    const validAudioBitrates = [96, 128, 160, 192, 256];
+    if (validAudioBitrates.includes(settings.audio_bitrate)) {
+      setSelectedAudioBitrate(settings.audio_bitrate);
+    }
+    const validResolutions = ["native", "720p", "800p", "1080p"];
+    if (validResolutions.includes(settings.resolution)) {
+      setSelectedResolution(settings.resolution);
+    }
+    const validFramerates = [30, 60];
+    if (validFramerates.includes(settings.framerate)) {
+      setSelectedFramerate(settings.framerate);
+    }
+    if (settings.rate_control && ["cbr", "vbr"].includes(settings.rate_control)) {
+      setRateControl(settings.rate_control);
+    }
+    if (typeof settings.keyframe_interval === 'number') {
+      const kf = settings.keyframe_interval > 10 ? 2 : settings.keyframe_interval;
+      setKeyframeInterval([0, 1, 2, 3, 4].includes(kf) ? kf : 2);
+    }
+    if (settings.encoder_preset) {
+      const validPresets = ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium"];
+      if (validPresets.includes(settings.encoder_preset)) {
+        setEncoderPreset(settings.encoder_preset);
+      }
+    }
+    const validBframes = [0, 1, 2, 3];
+    if (validBframes.includes(settings.bframes)) {
+      setBframes(settings.bframes);
+    }
+    if (typeof settings.mic_enabled === 'boolean') {
+      setMicrophone(settings.mic_enabled);
+    }
+    if (typeof settings.mic_gain === 'number') {
+      setMicGain(settings.mic_gain);
+    }
+    if (typeof settings.noise_reduction_percent === 'number') {
+      setNoiseReductionPercent(settings.noise_reduction_percent);
+    }
+    if (settings.mic_source) {
+      setMicSource((current) => {
+        const found = micSourcesList.find(s => s.data === settings.mic_source);
+        return found || current;
+      });
+    }
+  };
+
+  const refreshProfilesList = async (targetActiveId?: string) => {
+    try {
+      const profilesRes = await serverAPI.callPluginMethod('get_profiles', {});
+      const profilesList = (profilesRes.result as StreamProfile[]) || [];
+      setProfiles(profilesList);
+      if (targetActiveId) {
+        setActiveProfileId(targetActiveId);
+      } else {
+        const activeIdRes = await serverAPI.callPluginMethod('get_active_profile_id', {});
+        const activeId = (activeIdRes.result as string) || (profilesList[0]?.id || "default");
+        setActiveProfileId(activeId);
+      }
+    } catch (err) {
+      console.error("Failed to refresh profiles", err);
+    }
+  };
+
+  const switchProfile = async (profileId: string) => {
+    try {
+      const res = await serverAPI.callPluginMethod('switch_profile', { profile_id: profileId });
+      const result = res.result as any;
+      if (result && result.success) {
+        setActiveProfileId(profileId);
+        applySettings(result.settings);
+        const switched = profiles.find(p => p.id === profileId);
+        logic.notify("Profile Loaded", 1500, `Switched to ${switched?.name || "profile"}`);
+      } else if (result && result.error) {
+        logic.notify("Switch Failed", 2000, result.error);
+      }
+    } catch (err) {
+      console.error("Failed to switch profile", err);
+      logic.notify("Error", 2000, "Failed to switch profile");
     }
   };
 
@@ -285,19 +432,21 @@ const DeckyStreamer: VFC<{ serverAPI: ServerAPI, logic: DeckyStreamerLogic }> = 
   };
 
   // Text input modal component for cleaner keyboard handling
-  const TextInputModal = ({ title, currentValue, onSubmit, isPassword, closeModal }: {
+  const TextInputModal = ({ title, description, currentValue, onSubmit, isPassword, closeModal }: {
     title: string;
+    description?: string;
     currentValue: string;
     onSubmit: (value: string) => void;
     isPassword: boolean;
     closeModal?: () => void;
   }) => {
     const [value, setValue] = useState(currentValue);
+    const defaultDesc = isPassword ? "Enter your stream key" : (title.toLowerCase().includes("url") ? "Enter the URL" : `Enter ${title.toLowerCase()}`);
     
     return (
       <ConfirmModal
         strTitle={title}
-        strDescription={isPassword ? "Enter your stream key" : "Enter the URL"}
+        strDescription={description || defaultDesc}
         onOK={() => {
           onSubmit(value);
           closeModal?.();
@@ -318,13 +467,32 @@ const DeckyStreamer: VFC<{ serverAPI: ServerAPI, logic: DeckyStreamerLogic }> = 
   };
 
   // Show text input modal using Steam's keyboard
-  const showTextInputModal = (title: string, currentValue: string, onSubmit: (value: string) => void, isPassword: boolean = false) => {
+  const showTextInputModal = (
+    title: string,
+    currentValue: string,
+    onSubmit: (value: string) => void,
+    isPassword: boolean = false,
+    description?: string
+  ) => {
     showModal(
       <TextInputModal
         title={title}
+        description={description}
         currentValue={currentValue}
         onSubmit={onSubmit}
         isPassword={isPassword}
+      />
+    );
+  };
+
+  const showDeleteConfirmModal = (profileName: string, onConfirm: () => void) => {
+    showModal(
+      <ConfirmModal
+        strTitle="Delete Profile"
+        strDescription={`Are you sure you want to delete profile "${profileName}"? This cannot be undone.`}
+        strOKButtonText="Delete"
+        bDestructiveWarning={true}
+        onOK={() => onConfirm()}
       />
     );
   };
@@ -540,6 +708,129 @@ const DeckyStreamer: VFC<{ serverAPI: ServerAPI, logic: DeckyStreamerLogic }> = 
         )}
       </PanelSection>
 
+      <PanelSection title="Stream Profiles">
+        <PanelSectionRow>
+          <Dropdown
+            rgOptions={profiles.map(p => ({ data: p.id, label: p.name } as SingleDropdownOption))}
+            selectedOption={
+              profiles.map(p => ({ data: p.id, label: p.name } as SingleDropdownOption))
+                .find(o => o.data === activeProfileId) || { data: activeProfileId, label: profiles[0]?.name || "Default" }
+            }
+            strDefaultLabel={profiles.find(p => p.id === activeProfileId)?.name || "Select Profile"}
+            disabled={isStreaming}
+            onChange={async (option) => {
+              await switchProfile(option.data as string);
+            }}
+          />
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <div style={{ fontSize: '12px', color: '#888' }}>
+            Switch between saved stream configurations
+          </div>
+        </PanelSectionRow>
+
+        <PanelSectionRow>
+          <ButtonItem
+            layout="below"
+            disabled={isStreaming}
+            onClick={() => {
+              showTextInputModal(
+                "Create New Profile",
+                "",
+                async (profileName) => {
+                  const trimmed = profileName.trim();
+                  if (!trimmed) return;
+                  const res = await serverAPI.callPluginMethod('create_profile', {
+                    name: trimmed,
+                    copy_current: false
+                  });
+                  const result = res.result as any;
+                  if (result && result.success) {
+                    if (result.settings) {
+                      applySettings(result.settings);
+                    }
+                    await refreshProfilesList(result.active_profile_id);
+                    logic.notify("Profile Created", 1500, `Created new profile "${trimmed}"`);
+                  }
+                },
+                false,
+                "Enter a name for the new profile (starts with Twitch broadcasting standards)"
+              );
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px' }}>
+              <FaPlus />
+              <span>Create New Profile</span>
+            </div>
+          </ButtonItem>
+        </PanelSectionRow>
+
+        <PanelSectionRow>
+          <ButtonItem
+            layout="below"
+            disabled={isStreaming}
+            onClick={() => {
+              const currentProfile = profiles.find(p => p.id === activeProfileId);
+              showTextInputModal(
+                "Rename Profile",
+                currentProfile?.name || "",
+                async (newName) => {
+                  const trimmed = newName.trim();
+                  if (!trimmed) return;
+                  const res = await serverAPI.callPluginMethod('rename_profile', {
+                    profile_id: activeProfileId,
+                    new_name: trimmed
+                  });
+                  const result = res.result as any;
+                  if (result && result.success) {
+                    await refreshProfilesList(activeProfileId);
+                    logic.notify("Profile Renamed", 1500, `Renamed to "${trimmed}"`);
+                  }
+                },
+                false,
+                "Enter new name for profile"
+              );
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px' }}>
+              <FaEdit />
+              <span>Rename Active Profile</span>
+            </div>
+          </ButtonItem>
+        </PanelSectionRow>
+
+        <PanelSectionRow>
+          <ButtonItem
+            layout="below"
+            disabled={isStreaming || profiles.length <= 1}
+            onClick={() => {
+              const currentProfile = profiles.find(p => p.id === activeProfileId);
+              showDeleteConfirmModal(
+                currentProfile?.name || "Current",
+                async () => {
+                  const res = await serverAPI.callPluginMethod('delete_profile', {
+                    profile_id: activeProfileId
+                  });
+                  const result = res.result as any;
+                  if (result && result.success) {
+                    if (result.settings) {
+                      applySettings(result.settings);
+                    }
+                    await refreshProfilesList(result.active_profile_id);
+                    logic.notify("Profile Deleted", 1500, `Deleted profile "${currentProfile?.name || ''}"`);
+                  }
+                }
+              );
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px' }}>
+              <FaTrash />
+              <span>Delete Active Profile</span>
+            </div>
+          </ButtonItem>
+        </PanelSectionRow>
+      </PanelSection>
+
       <PanelSection title="Stream Settings">
         <PanelSectionRow>
           <Dropdown
@@ -586,7 +877,8 @@ const DeckyStreamer: VFC<{ serverAPI: ServerAPI, logic: DeckyStreamerLogic }> = 
             layout="below"
             disabled={isStreaming}
             onClick={() => {
-              showTextInputModal("Stream Key", streamKey, async (value) => {
+              showTextInputModal("Stream Key", streamKey.startsWith("*") ? "" : streamKey, async (value) => {
+                if (!value || value === "********") return;
                 setStreamKey(value);
                 await serverAPI.callPluginMethod('set_stream_key', { stream_key: value });
               }, true);
@@ -691,6 +983,25 @@ const DeckyStreamer: VFC<{ serverAPI: ServerAPI, logic: DeckyStreamerLogic }> = 
           <>
             <PanelSectionRow>
               <Dropdown
+                rgOptions={RATE_CONTROL_OPTIONS}
+                selectedOption={getSelectedOption(RATE_CONTROL_OPTIONS, rateControl)}
+                strDefaultLabel={getSelectedOption(RATE_CONTROL_OPTIONS, rateControl).label as string}
+                disabled={isStreaming}
+                onChange={(option) => {
+                  const value = option.data as string;
+                  setRateControl(value);
+                  serverAPI.callPluginMethod('set_rate_control', { rate_control: value });
+                }}
+              />
+            </PanelSectionRow>
+            <PanelSectionRow>
+              <div style={{ fontSize: '12px', color: '#888' }}>
+                Rate control (CBR is required by Twitch to prevent disconnects)
+              </div>
+            </PanelSectionRow>
+
+            <PanelSectionRow>
+              <Dropdown
                 rgOptions={KEYFRAME_INTERVAL_OPTIONS}
                 selectedOption={getSelectedOption(KEYFRAME_INTERVAL_OPTIONS, keyframeInterval)}
                 strDefaultLabel={getSelectedOption(KEYFRAME_INTERVAL_OPTIONS, keyframeInterval).label as string}
@@ -704,7 +1015,26 @@ const DeckyStreamer: VFC<{ serverAPI: ServerAPI, logic: DeckyStreamerLogic }> = 
             </PanelSectionRow>
             <PanelSectionRow>
               <div style={{ fontSize: '12px', color: '#888' }}>
-                GOP size (keyframe frequency)
+                Keyframe interval (Twitch requires 2 seconds)
+              </div>
+            </PanelSectionRow>
+
+            <PanelSectionRow>
+              <Dropdown
+                rgOptions={ENCODER_PRESET_OPTIONS}
+                selectedOption={getSelectedOption(ENCODER_PRESET_OPTIONS, encoderPreset)}
+                strDefaultLabel={getSelectedOption(ENCODER_PRESET_OPTIONS, encoderPreset).label as string}
+                disabled={isStreaming}
+                onChange={(option) => {
+                  const value = option.data as string;
+                  setEncoderPreset(value);
+                  serverAPI.callPluginMethod('set_encoder_preset', { preset: value });
+                }}
+              />
+            </PanelSectionRow>
+            <PanelSectionRow>
+              <div style={{ fontSize: '12px', color: '#888' }}>
+                Encoder preset (trades speed vs compression efficiency)
               </div>
             </PanelSectionRow>
 
@@ -723,7 +1053,7 @@ const DeckyStreamer: VFC<{ serverAPI: ServerAPI, logic: DeckyStreamerLogic }> = 
             </PanelSectionRow>
             <PanelSectionRow>
               <div style={{ fontSize: '12px', color: '#888' }}>
-                B-frames improve quality but add latency
+                B-frames improve quality (Twitch allows up to 2; 0 minimizes latency)
               </div>
             </PanelSectionRow>
           </>
