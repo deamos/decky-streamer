@@ -249,27 +249,77 @@ RTMP_MISSING_MESSAGE = (
 )
 
 
+GST_REGISTRY_PATH = LOG_DIR / "gst-registry.bin"
+
+
 def _streaming_env():
-    """Build env for GStreamer subprocess: use plugin's bin for libs (e.g. librtmp)."""
+    """Build env for GStreamer subprocess: prefer system libs/plugins, fall back to plugin's bundled bin."""
     env = os.environ.copy()
     env.pop("LD_PRELOAD", None)
-    # Prepend plugin bin so bundled librtmp (and other deps) are found when loading libgstrtmp
-    env["LD_LIBRARY_PATH"] = str(DEPSPATH)
-    env["GST_PLUGIN_PATH"] = str(GSTPLUGINSPATH)
+    # Put /usr/lib first so system GStreamer plugins use matching system libs (and system librtmp if installed),
+    # then DEPSPATH so bundled librtmp.so.1, nettle/hogweed, and libfdk-aac/faac are found when missing on host.
+    # Do not inherit Decky's PyInstaller LD_LIBRARY_PATH (/tmp/_MEI...), which can conflict with system libraries.
+    env["LD_LIBRARY_PATH"] = f"/usr/lib:{DEPSPATH}"
+    env["GST_PLUGIN_PATH"] = f"/usr/lib/gstreamer-1.0:{GSTPLUGINSPATH}"
+    env["GST_REGISTRY"] = str(GST_REGISTRY_PATH)
     return env
+
+
+def _reset_gst_registry_cache():
+    """Remove cached GStreamer plugin registry and in-memory inspect cache so blacklisted plugins are re-scanned."""
+    _GST_INSPECT_CACHE.clear()
+    try:
+        if GST_REGISTRY_PATH.exists():
+            GST_REGISTRY_PATH.unlink()
+    except Exception as e:
+        logger.debug(f"Could not remove GST_REGISTRY cache {GST_REGISTRY_PATH}: {e}")
 
 
 def _check_rtmpsink_available():
     """Return True if GStreamer rtmpsink element is available (librtmp loaded)."""
+    return bool(_get_rtmp_sink_element())
+
+
+def _get_rtmp_sink_element():
+    """Return the available RTMP sink element ('rtmpsink' preferred, 'rtmp2sink' fallback), or '' if neither is available."""
     env = _streaming_env()
-    result = subprocess.run(
-        ["gst-inspect-1.0", "rtmpsink"],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
-    return result.returncode == 0
+    for attempt in range(2):
+        result = subprocess.run(
+            ["gst-inspect-1.0", "rtmpsink"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            _GST_INSPECT_CACHE["rtmpsink"] = result.stdout
+            return "rtmpsink"
+        if attempt == 0:
+            stderr_msg = (result.stderr or "").strip()
+            if stderr_msg:
+                logger.warning(f"gst-inspect-1.0 rtmpsink failed (attempt 1), resetting registry cache: {stderr_msg[:500]}")
+            _reset_gst_registry_cache()
+
+    # Fall back to rtmp2sink (from libgstrtmp2.so, which does not depend on external librtmp/nettle)
+    if _gst_has_element("rtmp2sink"):
+        logger.warning("rtmpsink unavailable; falling back to rtmp2sink")
+        return "rtmp2sink"
+
+    return ""
+
+
+def _get_aac_encoder_element():
+    """Return the first available AAC encoder element (avenc_aac, fdkaacenc, faac, voaacenc)."""
+    candidates = ("avenc_aac", "fdkaacenc", "faac", "voaacenc")
+    for attempt in range(2):
+        for elem in candidates:
+            if _gst_has_element(elem):
+                return elem
+        if attempt == 0:
+            logger.warning("No AAC encoder found on first pass, resetting GStreamer registry cache")
+            _reset_gst_registry_cache()
+    logger.warning("No AAC encoder verified via gst-inspect-1.0; defaulting to fdkaacenc")
+    return "fdkaacenc"
 
 
 _GST_INSPECT_CACHE = {}
@@ -308,12 +358,56 @@ def _gst_element_has_property(element: str, prop: str):
     return False
 
 
+def _build_pipewire_source():
+    """Build pipewiresrc element string with SystemMemory capsfilter and stability properties for PipeWire 1.6+."""
+    props = ["do-timestamp=true"]
+    for prop, val in (
+        ("always-copy", "true"),
+        ("use-bufferpool", "false"),
+        ("min-buffers", "8"),
+        ("keepalive-time", "100"),
+        ("resend-last", "true"),
+    ):
+        if _gst_element_has_property("pipewiresrc", prop):
+            props.append(f"{prop}={val}")
+    # Follow pipewiresrc immediately with video/x-raw (SystemMemory) so GStreamer 1.28 videoconvert
+    # does not negotiate unmappable tiled DMA_DRM (memory:DMABuf) GPU buffers with Gamescope.
+    return f"pipewiresrc {' '.join(props)} ! video/x-raw"
+
+
+def _get_target_resolution(resolution):
+    """Return explicit (width, height) for the stream so downstream encoders never face mid-stream resolution changes."""
+    preset = RESOLUTION_PRESETS.get(resolution, RESOLUTION_PRESETS["720p"])
+    if preset["width"] > 0 and preset["height"] > 0:
+        return preset["width"], preset["height"]
+    detected = detect_display_resolution()
+    w = int(detected.get("width") or 1280)
+    h = int(detected.get("height") or 800)
+    return w, h
+
+
+def _has_x_client_on_display(display: str) -> bool:
+    """Return True if an X11 client process (other than Xwayland/Xorg) is attached to the given DISPLAY."""
+    try:
+        for proc in psutil.process_iter(["name"]):
+            try:
+                name = (proc.info.get("name") or "").lower()
+                if not name or "xwayland" in name or name == "xorg":
+                    continue
+                p_env = proc.environ()
+                if p_env.get("DISPLAY") == display:
+                    return True
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+    except Exception:
+        pass
+    return False
+
+
 def get_video_scale_caps(resolution):
     """Get the video scaling caps filter based on resolution preset"""
-    preset = RESOLUTION_PRESETS.get(resolution, RESOLUTION_PRESETS["720p"])
-    if preset["width"] == 0:
-        return ""
-    return f"video/x-raw,width={preset['width']},height={preset['height']}"
+    w, h = _get_target_resolution(resolution)
+    return f"video/x-raw,format=NV12,width={w},height={h},colorimetry=bt709"
 
 
 def detect_display_resolution():
@@ -508,6 +602,14 @@ class Plugin:
                 # Check for process crash/exit (is_streaming already handles this, 
                 # but we also want to check stderr for connection errors)
                 if self._streaming_process is not None:
+                    if (
+                        self._stream_start_time is not None
+                        and (time.time() - self._stream_start_time) >= 30
+                        and (self._reconnect_active or self._recovery_attempts > 0)
+                    ):
+                        self._recovery_attempts = 0
+                        Plugin._clear_reconnect_state(self)
+
                     # Periodically capture process health and stderr tail for postmortem diagnostics.
                     if self._watchdog_tick % 5 == 0:
                         try:
@@ -556,6 +658,11 @@ class Plugin:
             logger.info("Starting stream")
             self._user_requested_stop = False
             self._recovery_pending = False
+            if not self._reconnect_active:
+                self._capture_backend_preference = "pipewire"
+                self._recovery_attempts = 0
+                self._force_software_encoder = False
+                self._effective_fps_override = 0
             
             # Clear any previous error state
             self._stream_error = False
@@ -578,23 +685,23 @@ class Plugin:
             os.environ["HOME"] = decky_plugin.DECKY_USER_HOME
             
             # Find the correct DISPLAY for gamescope
-            # Gamescope typically creates :1 for the nested X server where games run
-            # Check which displays are available
+            # Gamescope typically creates :1 for the nested X server where games run,
+            # but :1 has no windows (and captures black via ximagesrc) when no X11 game is running on :1.
             display_check = get_cmd_output("ls /tmp/.X11-unix/ 2>/dev/null")
             logger.info(f"Available X displays: {display_check}")
             
-            # Build list of displays to try - prefer :1 (game content) then :0 (Steam UI)
             displays_to_try = []
-            if "X1" in display_check:
+            if "X1" in display_check and _has_x_client_on_display(":1"):
                 displays_to_try.append(":1")
             if "X0" in display_check:
                 displays_to_try.append(":0")
+            if "X1" in display_check and ":1" not in displays_to_try:
+                displays_to_try.append(":1")
             if not displays_to_try:
                 displays_to_try = [":0"]  # Default fallback
             
             logger.info(f"Will try displays in order: {displays_to_try}")
             
-            # Use the first available display (prefer :1 for game content)
             display_to_use = displays_to_try[0]
             os.environ["DISPLAY"] = display_to_use
             logger.info(f"Using DISPLAY={display_to_use}")
@@ -621,14 +728,15 @@ class Plugin:
                 f"[stream:{self._stream_session_id}] start config: {json.dumps(stream_config, sort_keys=True)}"
             )
 
-            # Fail fast if rtmpsink (librtmp) is not available
-            if not _check_rtmpsink_available():
+            # Fail fast if neither rtmpsink nor rtmp2sink is available
+            rtmp_sink = _get_rtmp_sink_element()
+            if not rtmp_sink:
                 logger.error("rtmpsink not available (librtmp missing)")
                 self._stream_error = True
                 self._last_error_message = RTMP_MISSING_MESSAGE
                 return False
 
-            # Get video scaling
+            # Get locked video scaling/format caps
             scale_caps = get_video_scale_caps(self._resolution)
             
             # Video bitrate in bits/second for GStreamer
@@ -638,13 +746,13 @@ class Plugin:
             logger.info(f"Using {capture_backend} for video capture")
             
             start_command = (
-                "GST_VAAPI_ALL_DRIVERS=1 GST_PLUGIN_PATH={} gst-launch-1.0 -e -vvv".format(
+                "GST_VAAPI_ALL_DRIVERS=1 GST_PLUGIN_PATH=/usr/lib/gstreamer-1.0:{} gst-launch-1.0 -e -vvv".format(
                     str(GSTPLUGINSPATH)
                 )
             )
             
             # Video pipeline using pipewiresrc (from working script)
-            # Using rtmpsink instead of rtmp2sink, simpler vaapih264enc config
+            # Using rtmpsink (with rtmp2sink fallback), simpler vaapih264enc config
             
             requested_fps = self._framerate
             effective_fps = self._effective_fps_override or requested_fps
@@ -690,46 +798,29 @@ class Plugin:
                         f"key-int-max={keyint_frames} bframes={self._bframes}"
                     )
 
+            aac_encoder = _get_aac_encoder_element()
             logger.info(
-                f"[stream:{self._stream_session_id}] encoder={encoder} options={encoder_opts}"
+                f"[stream:{self._stream_session_id}] encoder={encoder} options={encoder_opts} rtmp_sink={rtmp_sink} aac_encoder={aac_encoder}"
             )
             logger.info(f"Framerate: {effective_fps} fps")
 
-            # Build framerate caps
-            framerate_caps = f"video/x-raw,framerate={effective_fps}/1"
-            
-            video_source = "pipewiresrc do-timestamp=true"
+            video_source = _build_pipewire_source()
             if capture_backend == "ximagesrc":
-                video_source = "ximagesrc use-damage=0 show-pointer=false do-timestamp=true"
+                video_source = "ximagesrc use-damage=0 show-pointer=false do-timestamp=true ! video/x-raw"
 
-            if scale_caps:
-                video_pipeline = (
-                    f"{video_source} ! "
-                    f"videoconvert ! videoscale ! videorate ! {scale_caps},framerate={effective_fps}/1 ! "
-                    f"queue max-size-buffers=120 max-size-bytes=0 max-size-time=0 ! "
-                    f"{encoder} {encoder_opts} ! "
-                    f"h264parse config-interval=1 ! "
-                    f"queue max-size-buffers=120 max-size-bytes=0 max-size-time=0 ! "
-                    f"{'h264timestamper ! ' if _gst_has_element('h264timestamper') else ''}"
-                    f"flvmux name=mux streamable=true "
-                    f"{'enforce-increasing-timestamps=true ' if _gst_element_has_property('flvmux', 'enforce-increasing-timestamps') else ''}"
-                    f"{'skip-backwards-streams=true ' if _gst_element_has_property('flvmux', 'skip-backwards-streams') else ''}"
-                    f"! rtmpsink location=\"{rtmp_full_url}\" sync=false async=false"
-                )
-            else:
-                video_pipeline = (
-                    f"{video_source} ! "
-                    f"videoconvert ! videorate ! {framerate_caps} ! "
-                    f"queue max-size-buffers=120 max-size-bytes=0 max-size-time=0 ! "
-                    f"{encoder} {encoder_opts} ! "
-                    f"h264parse config-interval=1 ! "
-                    f"queue max-size-buffers=120 max-size-bytes=0 max-size-time=0 ! "
-                    f"{'h264timestamper ! ' if _gst_has_element('h264timestamper') else ''}"
-                    f"flvmux name=mux streamable=true "
-                    f"{'enforce-increasing-timestamps=true ' if _gst_element_has_property('flvmux', 'enforce-increasing-timestamps') else ''}"
-                    f"{'skip-backwards-streams=true ' if _gst_element_has_property('flvmux', 'skip-backwards-streams') else ''}"
-                    f"! rtmpsink location=\"{rtmp_full_url}\" sync=false async=false"
-                )
+            video_pipeline = (
+                f"{video_source} ! "
+                f"videoconvert ! videoscale ! videorate ! {scale_caps},framerate={effective_fps}/1 ! "
+                f"queue max-size-buffers=120 max-size-bytes=0 max-size-time=0 ! "
+                f"{encoder} {encoder_opts} ! "
+                f"h264parse config-interval=1 ! "
+                f"queue max-size-buffers=120 max-size-bytes=0 max-size-time=0 ! "
+                f"{'h264timestamper ! ' if _gst_has_element('h264timestamper') else ''}"
+                f"flvmux name=mux streamable=true "
+                f"{'enforce-increasing-timestamps=true ' if _gst_element_has_property('flvmux', 'enforce-increasing-timestamps') else ''}"
+                f"{'skip-backwards-streams=true ' if _gst_element_has_property('flvmux', 'skip-backwards-streams') else ''}"
+                f"! {rtmp_sink} location=\"{rtmp_full_url}\" sync=false async=false"
+            )
 
             cmd = f"{start_command} {video_pipeline}"
 
@@ -752,7 +843,7 @@ class Plugin:
                 + f'queue max-size-buffers=120 max-size-bytes=0 max-size-time=0 ! '
                 + f'audioconvert ! audioresample ! audiorate ! '
                 + f'audio/x-raw,rate=48000,channels=2 ! '
-                + f'avenc_aac bitrate={audio_bitrate_bps} ! '
+                + f'{aac_encoder} bitrate={audio_bitrate_bps} ! '
                 + f'aacparse ! '
                 + f'queue max-size-buffers=120 max-size-bytes=0 max-size-time=0 ! '
                 + f'mux.'
@@ -766,6 +857,14 @@ class Plugin:
             logger.info(
                 f"[stream:{self._stream_session_id}] env summary: LD_LIBRARY_PATH={env.get('LD_LIBRARY_PATH','')} GST_PLUGIN_PATH={env.get('GST_PLUGIN_PATH','')}"
             )
+            try:
+                std_out_file.seek(0)
+                std_out_file.truncate()
+                std_err_file.seek(0)
+                std_err_file.truncate()
+                self._stderr_last_mtime = std_err_file_path.stat().st_mtime if std_err_file_path.exists() else 0.0
+            except Exception:
+                pass
             self._streaming_process = subprocess.Popen(
                 cmd, shell=True, stdout=std_out_file, stderr=std_err_file, env=env,
                 start_new_session=True,
@@ -821,8 +920,6 @@ class Plugin:
                 return False
             
             self._stream_start_time = time.time()
-            self._recovery_attempts = 0
-            Plugin._clear_reconnect_state(self)
             logger.info("Streaming started!")
             return True
             
@@ -837,6 +934,8 @@ class Plugin:
         logger.info("Stopping stream")
         self._user_requested_stop = True
         self._recovery_pending = False
+        self._capture_backend_preference = "pipewire"
+        self._recovery_attempts = 0
         if self._streaming_process is None and self._reconnect_active:
             logger.info("Cancelling active reconnect loop")
             Plugin._clear_reconnect_state(self)
@@ -931,11 +1030,20 @@ class Plugin:
                 elif (
                     not self._user_requested_stop
                     and _is_pipewire_stream_error(stderr_tail)
-                    and self._recovery_attempts < 2
+                    and self._recovery_attempts < 3
                 ):
-                    self._capture_backend_preference = "ximagesrc"
                     self._recovery_attempts += 1
-                    if not Plugin._schedule_reconnect(self, "PipeWire capture failure", force_delay=1):
+                    if self._recovery_attempts == 1:
+                        self._capture_backend_preference = "pipewire"
+                        reason = "PipeWire pipeline error (retrying pipewire)"
+                    elif self._recovery_attempts == 2:
+                        self._capture_backend_preference = "pipewire"
+                        self._force_software_encoder = True
+                        reason = "PipeWire/VAAPI pipeline error (retrying pipewire with software encoder)"
+                    else:
+                        self._capture_backend_preference = "ximagesrc"
+                        reason = "PipeWire capture failure (falling back to ximagesrc)"
+                    if not Plugin._schedule_reconnect(self, reason, force_delay=1):
                         self._last_error_message = "Stream ended after repeated capture failures"
                 else:
                     self._stream_error = True
