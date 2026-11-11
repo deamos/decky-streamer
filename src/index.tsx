@@ -52,7 +52,8 @@ const BASE_RESOLUTION_OPTIONS: DropdownOption[] = [
   { data: "native", label: "Native (Display)" } as SingleDropdownOption,
   { data: "720p", label: "720p (1280x720)" } as SingleDropdownOption,
   { data: "800p", label: "800p (1280x800)" } as SingleDropdownOption,
-  { data: "1080p", label: "1080p (1920x1080)" } as SingleDropdownOption
+  { data: "1080p", label: "1080p (1920x1080)" } as SingleDropdownOption,
+  { data: "1200p", label: "1200p (1920x1200)" } as SingleDropdownOption
 ];
 
 // Audio bitrate options (defined outside component for stable reference)
@@ -279,7 +280,7 @@ const DeckyStreamer: VFC<{ serverAPI: ServerAPI, logic: DeckyStreamerLogic }> = 
       const getResolution = await serverAPI.callPluginMethod('get_resolution', {});
       const resolutionResult = getResolution.result as string;
       // Ensure it's a valid option
-      const validResolutions = ["native", "720p", "800p", "1080p"];
+      const validResolutions = ["native", "720p", "800p", "1080p", "1200p"];
       setSelectedResolution(validResolutions.includes(resolutionResult) ? resolutionResult : "720p");
 
       const getFramerate = await serverAPI.callPluginMethod('get_framerate', {});
@@ -347,7 +348,7 @@ const DeckyStreamer: VFC<{ serverAPI: ServerAPI, logic: DeckyStreamerLogic }> = 
     if (validAudioBitrates.includes(settings.audio_bitrate)) {
       setSelectedAudioBitrate(settings.audio_bitrate);
     }
-    const validResolutions = ["native", "720p", "800p", "1080p"];
+    const validResolutions = ["native", "720p", "800p", "1080p", "1200p"];
     if (validResolutions.includes(settings.resolution)) {
       setSelectedResolution(settings.resolution);
     }
