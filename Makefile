@@ -12,7 +12,7 @@ help: ## Display list of tasks with descriptions
 vendor: ## Install project dependencies
 	@echo "+ $@"
 	@pnpm i
-
++
 env: ## Create default .env file
 	@echo "+ $@"
 	@echo -e '# Makefile tools\nDECK_USER=deck\nDECK_HOST=\nDECK_PORT=22\nDECK_HOME=/home/deck\nDECK_KEY=~/.ssh/id_rsa' >> .env
