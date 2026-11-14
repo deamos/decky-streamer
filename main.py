@@ -182,6 +182,7 @@ RESOLUTION_PRESETS = {
     "720p": {"width": 1280, "height": 720},
     "800p": {"width": 1280, "height": 800},  # Steam Deck native
     "1080p": {"width": 1920, "height": 1080},
+    "1200p": {"width": 1920, "height": 1200},  # 1920x1200 (16:10)
     "native": {"width": 0, "height": 0}  # 0 means no scaling
 }
 
