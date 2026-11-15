@@ -14,6 +14,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Get version from package.json
         id: version
@@ -75,13 +77,41 @@ jobs:
           TAG="${{ steps.version.outputs.tag }}"
           gh release delete "$TAG" --yes
           git push --delete origin "$TAG" || true
+          git tag -d "$TAG" || true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate nightly changelog from commits
+        id: changelog
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          PREV_TAG=$(git tag --list 'v*' --sort=-version:refname | grep -v -- '-nightly$' | head -n 1 || true)
+          if [ -n "$PREV_TAG" ]; then
+            COMMITS=$(git log --no-merges --pretty=format:"* %s (%h)" "${PREV_TAG}..HEAD")
+            if [ -z "$COMMITS" ]; then
+              COMMITS=$(git log -n 10 --no-merges --pretty=format:"* %s (%h)" HEAD)
+            fi
+            COMPARE_LINE="**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${TAG}"
+          else
+            COMMITS=$(git log -n 10 --no-merges --pretty=format:"* %s (%h)" HEAD)
+            COMPARE_LINE=""
+          fi
+          {
+            echo "notes<<EOF"
+            echo "## What's Changed (Nightly)"
+            echo "$COMMITS"
+            if [ -n "$COMPARE_LINE" ]; then
+              echo ""
+              echo "$COMPARE_LINE"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Create Nightly Release
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ steps.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           name: Decky Streamer v${{ steps.version.outputs.version }} (Nightly)
           body: |
             Nightly pre-release build from the `nightly` branch.
@@ -96,10 +126,11 @@ jobs:
             See the [README](https://github.com/${{ github.repository }}/blob/nightly/README.md) for full documentation.
 
             ---
+
+            ${{ steps.changelog.outputs.notes }}
           files: decky-streamer.zip
           draft: false
           prerelease: true
-          generate_release_notes: true
+          generate_release_notes: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
