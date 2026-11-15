@@ -253,16 +253,72 @@ RTMP_MISSING_MESSAGE = (
 GST_REGISTRY_PATH = LOG_DIR / "gst-registry.bin"
 
 
+def _os_release_value(key: str):
+    try:
+        with open("/etc/os-release", "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith(f"{key}="):
+                    value = line.split("=", 1)[1].strip().strip('"')
+                    return value
+    except Exception:
+        pass
+    return ""
+
+
+def _is_steamos():
+    os_name = (_os_release_value("NAME") + " " + _os_release_value("ID") + " " + _os_release_value("ID_LIKE")).lower()
+    return "steamos" in os_name or "steam os" in os_name
+
+
+def _gst_runtime_settings():
+    """Prefer the system GStreamer runtime on non-SteamOS hosts and avoid loading mixed bundle+host plugin dirs.
+
+    This prevents ABI mismatches such as a bundle built for SteamOS being scanned alongside the host's
+    GStreamer plugins on Fedora/Bazzite, which causes gst-plugin-scanner warnings and pipeline startup failure.
+    """
+    system_dirs = []
+    for candidate in ("/usr/lib/gstreamer-1.0", "/usr/lib64/gstreamer-1.0"):
+        if Path(candidate).exists():
+            system_dirs.append(candidate)
+
+    if system_dirs:
+        ld_dirs = [p for p in ("/usr/lib", "/usr/lib64") if Path(p).exists()]
+        ld_value = ":".join(ld_dirs) if ld_dirs else "/usr/lib"
+        return {
+            "ld_library_path": ld_value,
+            "gst_plugin_path": ":".join(system_dirs),
+            "using_bundle": False,
+        }
+
+    if GSTPLUGINSPATH.exists():
+        return {
+            "ld_library_path": f"/usr/lib:{DEPSPATH}",
+            "gst_plugin_path": str(GSTPLUGINSPATH),
+            "using_bundle": True,
+        }
+
+    return {
+        "ld_library_path": "/usr/lib",
+        "gst_plugin_path": "/usr/lib/gstreamer-1.0",
+        "using_bundle": False,
+    }
+
+
 def _streaming_env():
-    """Build env for GStreamer subprocess: prefer system libs/plugins, fall back to plugin's bundled bin."""
+    """Build env for GStreamer subprocess. Prefer the system runtime and never mix it with the bundled plugin dir."""
     env = os.environ.copy()
     env.pop("LD_PRELOAD", None)
-    # Put /usr/lib first so system GStreamer plugins use matching system libs (and system librtmp if installed),
-    # then DEPSPATH so bundled librtmp.so.1, nettle/hogweed, and libfdk-aac/faac are found when missing on host.
-    # Do not inherit Decky's PyInstaller LD_LIBRARY_PATH (/tmp/_MEI...), which can conflict with system libraries.
-    env["LD_LIBRARY_PATH"] = f"/usr/lib:{DEPSPATH}"
-    env["GST_PLUGIN_PATH"] = f"/usr/lib/gstreamer-1.0:{GSTPLUGINSPATH}"
+    runtime = _gst_runtime_settings()
+    env["LD_LIBRARY_PATH"] = runtime["ld_library_path"]
+    env["GST_PLUGIN_PATH"] = runtime["gst_plugin_path"]
     env["GST_REGISTRY"] = str(GST_REGISTRY_PATH)
+    if runtime["using_bundle"]:
+        logger.warning("Using bundled GStreamer runtime; system GStreamer is unavailable.")
+    else:
+        logger.debug(f"Using system GStreamer runtime: {runtime['gst_plugin_path']}")
     return env
 
 
@@ -746,9 +802,10 @@ class Plugin:
             capture_backend = self._capture_backend_preference
             logger.info(f"Using {capture_backend} for video capture")
             
+            runtime = _gst_runtime_settings()
             start_command = (
-                "GST_VAAPI_ALL_DRIVERS=1 GST_PLUGIN_PATH=/usr/lib/gstreamer-1.0:{} gst-launch-1.0 -e -vvv".format(
-                    str(GSTPLUGINSPATH)
+                "GST_VAAPI_ALL_DRIVERS=1 GST_PLUGIN_PATH={} gst-launch-1.0 -e -vvv".format(
+                    runtime["gst_plugin_path"]
                 )
             )
             
@@ -949,7 +1006,7 @@ class Plugin:
         if await Plugin.is_streaming(self) == False:
             logger.info("Error: No streaming process to stop")
             return
-            
+        
         logger.info("Sending SIGINT")
         proc = self._streaming_process
         self._streaming_process = None
