@@ -237,11 +237,39 @@ def _tail_text(path: Path, line_count: int = 40):
         return ""
 
 
-def _is_pipewire_stream_error(stderr_tail: str):
+def _is_pipewire_paused_failure(stderr_tail: str, capture_backend: str = "pipewire"):
+    if not stderr_tail or capture_backend != "pipewire":
+        return False
+    return "failed to set pipeline to paused" in stderr_tail.lower()
+
+
+def _is_pipewire_stream_error(stderr_tail: str, capture_backend: str = "pipewire"):
     if not stderr_tail:
         return False
     s = stderr_tail.lower()
-    return "gstpipewiresrc" in s and "reason error (-5)" in s
+    if "gstpipewiresrc" in s and ("reason error (-5)" in s or "reason not-negotiated (-4)" in s):
+        return True
+    if _is_pipewire_paused_failure(stderr_tail, capture_backend):
+        return True
+    return False
+
+
+def _has_pipewire_video_source() -> bool:
+    """Return False only if pw-dump succeeds and confirms no Video/Source node exists in PipeWire."""
+    try:
+        env = get_pulse_env()
+        res = subprocess.run(
+            ["pw-dump"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if res.returncode != 0 or not res.stdout.strip():
+            return True
+        return "Video/Source" in res.stdout
+    except Exception:
+        return True
 
 
 RTMP_MISSING_MESSAGE = (
@@ -253,15 +281,49 @@ RTMP_MISSING_MESSAGE = (
 GST_REGISTRY_PATH = LOG_DIR / "gst-registry.bin"
 
 
+def _system_gst_paths():
+    """Return (sys_lib_dirs, sys_plugin_dirs) for 64-bit host GStreamer before falling back to bundled bin."""
+    # On Fedora/Bazzite x86_64, /usr/lib64 (64-bit) and /usr/lib (32-bit i686) are separate directories.
+    # On SteamOS/Arch x86_64, /usr/lib64 is a symlink to /usr/lib.
+    if (
+        os.path.isdir("/usr/lib64/gstreamer-1.0")
+        and os.path.realpath("/usr/lib64") != os.path.realpath("/usr/lib")
+    ):
+        return ["/usr/lib64"], ["/usr/lib64/gstreamer-1.0"]
+
+    lib_dirs = []
+    plugin_dirs = []
+    for lib_cand, plug_cand in (
+        ("/usr/lib", "/usr/lib/gstreamer-1.0"),
+        ("/usr/lib64", "/usr/lib64/gstreamer-1.0"),
+        ("/usr/lib/x86_64-linux-gnu", "/usr/lib/x86_64-linux-gnu/gstreamer-1.0"),
+    ):
+        if os.path.isdir(plug_cand):
+            real_lib = os.path.realpath(lib_cand)
+            if real_lib not in [os.path.realpath(d) for d in lib_dirs]:
+                lib_dirs.append(lib_cand)
+            real_plug = os.path.realpath(plug_cand)
+            if real_plug not in [os.path.realpath(d) for d in plugin_dirs]:
+                plugin_dirs.append(plug_cand)
+    if not lib_dirs:
+        lib_dirs = ["/usr/lib"]
+    if not plugin_dirs:
+        plugin_dirs = ["/usr/lib/gstreamer-1.0"]
+    return lib_dirs, plugin_dirs
+
+
 def _streaming_env():
-    """Build env for GStreamer subprocess: prefer system libs/plugins, fall back to plugin's bundled bin."""
+    """Build env for GStreamer subprocess: prefer 64-bit system libs/plugins, fall back to plugin's bundled bin."""
     env = os.environ.copy()
     env.pop("LD_PRELOAD", None)
-    # Put /usr/lib first so system GStreamer plugins use matching system libs (and system librtmp if installed),
-    # then DEPSPATH so bundled librtmp.so.1, nettle/hogweed, and libfdk-aac/faac are found when missing on host.
+    # Put host 64-bit lib/plugin paths first (/usr/lib64 on Bazzite/Fedora, /usr/lib on SteamOS/Arch)
+    # so system GStreamer plugins use matching system libs, then DEPSPATH/GSTPLUGINSPATH as fallback
+    # for bundled librtmp.so.1, nettle/hogweed, and libfdk-aac/faac when missing on host.
     # Do not inherit Decky's PyInstaller LD_LIBRARY_PATH (/tmp/_MEI...), which can conflict with system libraries.
-    env["LD_LIBRARY_PATH"] = f"/usr/lib:{DEPSPATH}"
-    env["GST_PLUGIN_PATH"] = f"/usr/lib/gstreamer-1.0:{GSTPLUGINSPATH}"
+    sys_lib_dirs, sys_plugin_dirs = _system_gst_paths()
+    env["LD_LIBRARY_PATH"] = ":".join(sys_lib_dirs + [str(DEPSPATH)])
+    env["GST_PLUGIN_PATH"] = ":".join(sys_plugin_dirs + [str(GSTPLUGINSPATH)])
+    env["GST_PLUGIN_SYSTEM_PATH"] = ":".join(sys_plugin_dirs)
     env["GST_REGISTRY"] = str(GST_REGISTRY_PATH)
     return env
 
@@ -744,12 +806,17 @@ class Plugin:
             video_bitrate_bps = self._videoBitrate * 1000
 
             capture_backend = self._capture_backend_preference
+            if capture_backend == "pipewire" and not _has_pipewire_video_source():
+                logger.warning(
+                    f"[stream:{self._stream_session_id}] No PipeWire Video/Source node found; falling back to ximagesrc"
+                )
+                capture_backend = "ximagesrc"
+                self._capture_backend_preference = "ximagesrc"
             logger.info(f"Using {capture_backend} for video capture")
             
+            env = _streaming_env()
             start_command = (
-                "GST_VAAPI_ALL_DRIVERS=1 GST_PLUGIN_PATH=/usr/lib/gstreamer-1.0:{} gst-launch-1.0 -e -vvv".format(
-                    str(GSTPLUGINSPATH)
-                )
+                f"GST_VAAPI_ALL_DRIVERS=1 GST_PLUGIN_PATH={env['GST_PLUGIN_PATH']} gst-launch-1.0 -e -vvv"
             )
             
             # Video pipeline using pipewiresrc (from working script)
@@ -1030,20 +1097,27 @@ class Plugin:
                         self._last_error_message = "Stream ended after repeated RTMP disconnects"
                 elif (
                     not self._user_requested_stop
-                    and _is_pipewire_stream_error(stderr_tail)
+                    and _is_pipewire_stream_error(stderr_tail, self._capture_backend_preference)
                     and self._recovery_attempts < 3
                 ):
-                    self._recovery_attempts += 1
-                    if self._recovery_attempts == 1:
-                        self._capture_backend_preference = "pipewire"
-                        reason = "PipeWire pipeline error (retrying pipewire)"
-                    elif self._recovery_attempts == 2:
-                        self._capture_backend_preference = "pipewire"
-                        self._force_software_encoder = True
-                        reason = "PipeWire/VAAPI pipeline error (retrying pipewire with software encoder)"
-                    else:
+                    if _is_pipewire_paused_failure(stderr_tail, self._capture_backend_preference):
+                        # pipewiresrc timed out (30s) transitioning NULL->PAUSED; skip retrying pipewiresrc
+                        # and fall back immediately to ximagesrc so we don't exceed the 90s reconnect grace window.
+                        self._recovery_attempts = 3
                         self._capture_backend_preference = "ximagesrc"
-                        reason = "PipeWire capture failure (falling back to ximagesrc)"
+                        reason = "PipeWire failed to reach PAUSED (falling back to ximagesrc)"
+                    else:
+                        self._recovery_attempts += 1
+                        if self._recovery_attempts == 1:
+                            self._capture_backend_preference = "pipewire"
+                            reason = "PipeWire pipeline error (retrying pipewire)"
+                        elif self._recovery_attempts == 2:
+                            self._capture_backend_preference = "pipewire"
+                            self._force_software_encoder = True
+                            reason = "PipeWire/VAAPI pipeline error (retrying pipewire with software encoder)"
+                        else:
+                            self._capture_backend_preference = "ximagesrc"
+                            reason = "PipeWire capture failure (falling back to ximagesrc)"
                     if not Plugin._schedule_reconnect(self, reason, force_delay=1):
                         self._last_error_message = "Stream ended after repeated capture failures"
                 else:
@@ -1750,6 +1824,7 @@ class Plugin:
         }
 
     async def _main(self):
+        _reset_gst_registry_cache()
         env = get_pulse_env()
         os.environ["XDG_RUNTIME_DIR"] = env.get("XDG_RUNTIME_DIR", "/run/user/1000")
         if "PULSE_SERVER" in env:

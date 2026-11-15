@@ -50,6 +50,8 @@ RUN cd /pacman/usr/lib/gstreamer-1.0/ && rm -f \
     libgstopenexr.so \
     libgstfluidsynthmidi.so \
     libgstsvthevcenc.so \
+    libgstsvtav1.so \
+    libgstwebrtcdsp.so \
     libgstwavpack.so \
     libgstde265.so \
     libgstsrtp.so \

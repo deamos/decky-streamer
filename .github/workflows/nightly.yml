@@ -1,0 +1,105 @@
+name: Build and Release (Nightly)
+
+on:
+  push:
+    branches:
+      - nightly
+
+jobs:
+  build-and-release-nightly:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get version from package.json
+        id: version
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          TAG="v${VERSION}-nightly"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Plugin nightly version: $VERSION (tag: $TAG)"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build backend (GStreamer libraries)
+        working-directory: backend
+        run: |
+          docker build -t decky-streamer-backend .
+          docker run --rm -v $(pwd):/backend -v $(pwd)/out:/backend/out --entrypoint /backend/entrypoint.sh decky-streamer-backend
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: 8
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Build frontend
+        run: pnpm run build
+
+      - name: Package plugin
+        run: |
+          mkdir -p tmp/decky-streamer
+          cp -r dist tmp/decky-streamer/
+          cp -r backend/out tmp/decky-streamer/bin
+          cp main.py settings.py plugin.json package.json tmp/decky-streamer/
+          cd tmp && zip -r ../decky-streamer.zip decky-streamer
+
+      - name: Check if nightly release exists
+        id: check_release
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          if gh release view "$TAG" &>/dev/null; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Delete existing nightly release (if exists)
+        if: steps.check_release.outputs.exists == 'true'
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          gh release delete "$TAG" --yes
+          git push --delete origin "$TAG" || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create Nightly Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Decky Streamer v${{ steps.version.outputs.version }} (Nightly)
+          body: |
+            Nightly pre-release build from the `nightly` branch.
+
+            Stream your Steam Deck gameplay to RTMP endpoints like Twitch, YouTube, Kick, and more!
+
+            ## Installation
+            1. Download `decky-streamer.zip`
+            2. Extract and copy the `decky-streamer` folder to `~/homebrew/plugins/`
+            3. Restart Decky Loader or reboot your Steam Deck
+
+            See the [README](https://github.com/${{ github.repository }}/blob/nightly/README.md) for full documentation.
+
+            ---
+          files: decky-streamer.zip
+          draft: false
+          prerelease: true
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
